@@ -511,14 +511,22 @@ def main():
     class CustomTrainer(Trainer):
         def create_optimizer(self):
             if self.optimizer is None:
-                # Nhóm 1: Các tham số thuộc backbone LayoutLMv3
-                backbone_params = [p for n, p in self.model.named_parameters() if "layoutlmv3" in n and p.requires_grad]
-                # Nhóm 2: Các tham số mới (segment_context, classifier, is_first_token_embedding, gate)
-                new_params = [p for n, p in self.model.named_parameters() if "layoutlmv3" not in n and p.requires_grad]
+                decay_parameters = self.get_decay_parameter_names(self.model)
+                
+                # Phân tách 4 nhóm tham số
+                backbone_decay = [p for n, p in self.model.named_parameters() if "layoutlmv3" in n and n in decay_parameters and p.requires_grad]
+                backbone_nodecay = [p for n, p in self.model.named_parameters() if "layoutlmv3" in n and n not in decay_parameters and p.requires_grad]
+                
+                new_decay = [p for n, p in self.model.named_parameters() if "layoutlmv3" not in n and n in decay_parameters and p.requires_grad]
+                new_nodecay = [p for n, p in self.model.named_parameters() if "layoutlmv3" not in n and n not in decay_parameters and p.requires_grad]
 
                 optimizer_grouped_parameters = [
-                    {"params": backbone_params, "lr": self.args.learning_rate}, # Dùng LR từ tham số truyền vào (VD: 1e-5)
-                    {"params": new_params, "lr":5e-4} # Ép cứng LR lớn hơn cho module mới
+                    # Backbone (LayoutLMv3 gốc): LR thấp
+                    {"params": backbone_decay, "lr": self.args.learning_rate, "weight_decay": self.args.weight_decay},
+                    {"params": backbone_nodecay, "lr": self.args.learning_rate, "weight_decay": 0.0},
+                    # Module mới (Segment, Gate, Classifier): LR cao
+                    {"params": new_decay, "lr": 5e-4, "weight_decay": self.args.weight_decay},
+                    {"params": new_nodecay, "lr": 5e-4, "weight_decay": 0.0}
                 ]
                 
                 self.optimizer = torch.optim.AdamW(

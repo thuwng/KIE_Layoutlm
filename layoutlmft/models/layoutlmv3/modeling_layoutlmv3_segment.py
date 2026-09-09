@@ -67,16 +67,11 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
                 batch_first=True,
             )
             self.segment_context = nn.TransformerEncoder(encoder_layer, num_layers=seg_ctx_layers)
-            self.segment_context_gate = nn.Parameter(torch.zeros(1))
-            
-            # NEW: positional embedding cho THỨ TỰ segment trong document (reading order)
-            max_pos = getattr(config, "segment_context_max_positions", 128)
-            self.segment_position_embedding = nn.Embedding(max_pos, config.hidden_size)
-            nn.init.normal_(self.segment_position_embedding.weight, mean=0.0, std=0.02)
+            self.segment_context_gate = nn.Parameter(torch.zeros(config.hidden_size))
+            # ĐÃ XÓA 1D EMBEDDING Ở ĐÂY
         else:
             self.segment_context = None
             self.segment_context_gate = None
-            self.segment_position_embedding = None
 
         # Small embedding so the classifier can still tell "first token of the
         # segment" (-> should predict B-xxx) apart from the rest (-> I-xxx),
@@ -90,23 +85,7 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
         # for param in self.layoutlmv3.parameters():
         #     param.requires_grad = False
 
-    def _segment_pool_and_contextualize(self, text_hidden, seg_id):
-        """
-        text_hidden: (B, L, H) hidden states for the TEXT part only
-                     (image-patch positions, if any, are handled separately
-                     by the caller and never enter this function).
-        seg_id:      (B, L) long tensor. -1 marks tokens that do not belong
-                     to any segment (special tokens / padding). Non-negative
-                     values are LOCAL segment indices per example, assigned
-                     in reading order (0, 1, 2, ...), exactly matching the
-                     bbox-equality grouping used in run_funsd_cord.py's
-                     tokenize_and_align_labels (see patch).
-
-        Returns:
-            broadcast_hidden: (B, L, H) -- every token belonging to the same
-                segment gets an IDENTICAL context-enriched vector (before the
-                is-first-token embedding is added back in `forward`).
-        """
+    def _segment_pool_and_contextualize(self, text_hidden, seg_id, bbox):
         B, L, H = text_hidden.shape
         device = text_hidden.device
         broadcast_hidden = text_hidden.clone()
@@ -121,16 +100,22 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
             n_seg = uniq_segs.shape[0]
 
             seg_vecs = torch.zeros(n_seg, H, device=device, dtype=text_hidden.dtype)
+            seg_bboxes = torch.zeros(n_seg, 4, device=device, dtype=bbox.dtype) # LƯU BBOX TỪNG SEGMENT
+            
             seg_masks = []
             for i, s in enumerate(uniq_segs):
                 mask = ids == s
                 seg_masks.append(mask)
                 seg_vecs[i] = text_hidden[b, mask].mean(dim=0)
+                seg_bboxes[i] = bbox[b, mask][0] # Lấy bbox đại diện cho segment (token đầu tiên)
 
             if self.segment_context is not None:
-                max_pos = self.segment_position_embedding.num_embeddings
-                positions = torch.arange(n_seg, device=device).clamp(max=max_pos - 1)
-                seg_vecs_with_pos = seg_vecs + self.segment_position_embedding(positions)
+                # SỬ DỤNG MODULE 2D EMBEDDING CÓ SẴN CỦA BACKBONE
+                spatial_emb = self.layoutlmv3.embeddings._calc_spatial_position_embeddings(seg_bboxes.unsqueeze(0)).squeeze(0)
+                
+                # Cộng 2D embedding vào đặc trưng của segment
+                seg_vecs_with_pos = seg_vecs + spatial_emb
+                
                 ctx_out = self.segment_context(seg_vecs_with_pos.unsqueeze(0)).squeeze(0)
                 seg_vecs_ctx = seg_vecs + self.segment_context_gate * (ctx_out - seg_vecs)
             else:
@@ -181,7 +166,8 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
         image_hidden = sequence_output[:, text_len:, :]
 
         if seg_id is not None:
-            text_hidden = self._segment_pool_and_contextualize(text_hidden, seg_id)
+            # Truyền thêm tham số bbox (chỉ lấy phần của text)
+            text_hidden = self._segment_pool_and_contextualize(text_hidden, seg_id, bbox[:, :text_len, :])
 
             # Add the is-first-token-of-segment signal so the classifier can
             # still distinguish B- from I- despite the shared pooled vector.
