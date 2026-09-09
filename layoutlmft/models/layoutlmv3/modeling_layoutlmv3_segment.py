@@ -98,6 +98,9 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
             nn.init.zeros_(self.layoutlmv3.embeddings.hpe_proj.weight)
             nn.init.zeros_(self.layoutlmv3.embeddings.hpe_proj.bias)
 
+        self.segment_attn_query = nn.Linear(config.hidden_size, config.hidden_size)
+        self.segment_attn_proj = nn.Linear(config.hidden_size, 1)
+
     def _segment_pool_and_contextualize(self, text_hidden, seg_id):
         B, L, H = text_hidden.shape
         device = text_hidden.device
@@ -113,17 +116,24 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
             n_seg = uniq_segs.shape[0]
 
             seg_vecs = torch.zeros(n_seg, H, device=device, dtype=text_hidden.dtype)
-
             seg_masks = []
+
             for i, s in enumerate(uniq_segs):
                 mask = ids == s
                 seg_masks.append(mask)
-                seg_vecs[i] = text_hidden[b, mask].mean(dim=0)
+                token_feats = text_hidden[b, mask]  # Shape: (num_tokens_in_seg, H)
+                
+                # ---- ADAPTIVE ATTENTION POOLING LOGIC ----
+                # Tính điểm attention cho các token trong segment
+                # score shape: (num_tokens_in_seg, 1)
+                score = self.segment_attn_proj(torch.tanh(self.segment_attn_query(token_feats)))
+                attn_weights = torch.softmax(score, dim=0) # Chuẩn hóa trọng số tổng bằng 1
+                
+                # Vector đại diện segment là tổng có trọng số (weighted sum) thay vì mean pooling
+                seg_vecs[i] = torch.sum(token_feats * attn_weights, dim=0)
 
             if self.segment_context is not None:
-                # 1D order embedding theo thứ tự đọc (reading order) — đúng mục 3.3 báo cáo:
-                # chỉ cộng Positional Embedding 1D, không cộng lại spatial/2D embedding
-                # (thông tin bbox đã được backbone mã hoá vào seg_vecs từ trước rồi).
+                # 1D order embedding theo thứ tự đọc (reading order)
                 order_ids = torch.arange(n_seg, device=device).clamp(
                     max=self.segment_position_embedding.num_embeddings - 1
                 )
@@ -139,7 +149,7 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
                 broadcast_hidden[b, mask] = seg_vecs_ctx[i]
 
         return broadcast_hidden
-
+    
     def forward(
         self,
         input_ids=None,
