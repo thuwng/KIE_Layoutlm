@@ -629,26 +629,44 @@ def main():
             return self.optimizer
 
         def log(self, logs: dict) -> None:
-            # Lấy reference tới model (xử lý cả trường hợp dùng DataParallel/Distributed)
             model = self.model.module if hasattr(self.model, "module") else self.model
             
-            # Đọc giá trị trung bình (mean) hoặc max/min của các cổng (gates) để xem nó đang "học" thế nào
+            # 1. Trích xuất custom metrics
             if hasattr(model, "token_gate") and model.token_gate is not None:
                 logs["token_gate_mean"] = model.token_gate.data.mean().item()
-            
             if hasattr(model, "segment_context_gate") and model.segment_context_gate is not None:
                 logs["segment_context_gate_mean"] = model.segment_context_gate.data.mean().item()
-
-            # NEW (Bước 2): theo dõi aux loss để biết segment_context có
-            # đang thực sự học được gì không (nên giảm dần theo step).
             if getattr(model, "_last_aux_seg_loss", None) is not None:
                 logs["segment_aux_loss"] = model._last_aux_seg_loss.item()
-
-            # Bạn có thể thêm bất kỳ tham số nào khác cần theo dõi ở đây
             
-            # Gọi hàm log gốc để ghi vào file trainer_state.json và in ra console
+            # 2. Gọi hàm log gốc để vẫn báo cáo cho Hugging Face / W&B
             super().log(logs)
 
+            # 3. LƯU KẾT QUẢ RIÊNG RA FILE CSV (Chỉ chạy trên process chính)
+            if self.is_world_process_zero():
+                # Tạo file custom_gate_metrics.csv trong thư mục output
+                output_file = os.path.join(self.args.output_dir, "custom_gate_metrics.csv")
+                file_exists = os.path.isfile(output_file)
+                
+                # Mở file chế độ append ('a') để ghi thêm liên tục
+                with open(output_file, mode='a', newline='') as f:
+                    writer = csv.writer(f)
+                    
+                    # Khởi tạo Header nếu file chưa tồn tại
+                    if not file_exists:
+                        writer.writerow(["step", "epoch", "train_loss", "eval_loss", "token_gate_mean", "segment_context_gate_mean", "segment_aux_loss"])
+                    
+                    # Lọc giá trị để ghi (nếu step đó không có eval_loss thì để trống)
+                    writer.writerow([
+                        self.state.global_step,
+                        round(self.state.epoch or 0, 2),
+                        logs.get("loss", ""),          # Train loss
+                        logs.get("eval_loss", ""),     # Eval loss
+                        round(logs.get("token_gate_mean", 0), 6) if "token_gate_mean" in logs else "",
+                        round(logs.get("segment_context_gate_mean", 0), 6) if "segment_context_gate_mean" in logs else "",
+                        round(logs.get("segment_aux_loss", 0), 6) if "segment_aux_loss" in logs else ""
+                    ])
+                    
     # Khởi tạo Trainer bằng CustomTrainer vừa tạo thay vì Trainer mặc định
     trainer = CustomTrainer(
         model=model,
