@@ -148,6 +148,13 @@ class DataTrainingArguments:
             "inter-segment context head) instead of the vanilla per-token classification head."
         },
     )
+    use_hpe: bool = field(
+        default=False,
+        metadata={
+            "help": "Compute per-token line_id/block_id (Hierarchical Position Encoding) "
+            "and feed them into LayoutLMv3ForSegmentTokenClassification. Requires --use_segment_head."
+        },
+    )
     data_dir: Optional[str] = field(default=None)
     input_size: int = field(default=224, metadata={"help": "images input size for backbone"})
     second_input_size: int = field(default=112, metadata={"help": "images input size for discrete vae"})
@@ -266,6 +273,7 @@ def main():
         revision=model_args.model_revision,
         input_size=data_args.input_size,
         use_auth_token=True if model_args.use_auth_token else None,
+        use_hpe=getattr(data_args, "use_hpe", False),
     )
     tokenizer = AutoTokenizer.from_pretrained(
         model_args.tokenizer_name if model_args.tokenizer_name else model_args.model_name_or_path,
@@ -330,6 +338,32 @@ def main():
                 std=torch.tensor(std))
         ])
 
+    def compute_hierarchical_ids(word_bboxes, theta_line, theta_block_x, theta_block_y):
+        """
+        Tính LineID và BlockID cấp từ (word-level), theo đúng công thức 3.1–3.6 trong báo cáo:
+        - cùng dòng nếu |y_center(i) - y_center(i-1)| <= theta_line
+        - cùng khối nếu delta_x <= theta_block_x VÀ delta_y <= theta_block_y
+        """
+        line_ids, block_ids = [], []
+        line_counter, block_counter = -1, -1
+        prev_x_center, prev_y_center = None, None
+        for wb in word_bboxes:
+            x1, y1, x2, y2 = wb
+            x_center = (x1 + x2) / 2
+            y_center = (y1 + y2) / 2
+            if prev_y_center is None or abs(y_center - prev_y_center) > theta_line:
+                line_counter += 1
+            if (
+                prev_x_center is None
+                or abs(x_center - prev_x_center) > theta_block_x
+                or abs(y_center - prev_y_center) > theta_block_y
+            ):
+                block_counter += 1
+            line_ids.append(line_counter)
+            block_ids.append(block_counter)
+            prev_x_center, prev_y_center = x_center, y_center
+        return line_ids, block_ids
+
     # Tokenize all texts and align the labels with them.
     def tokenize_and_align_labels(examples, augmentation=False):
         tokenized_inputs = tokenizer(
@@ -345,6 +379,8 @@ def main():
         bboxes = []
         images = []
         seg_ids = []  # NEW: per-token local segment index, for LayoutLMv3ForSegmentTokenClassification
+        line_ids = []
+        block_ids = []
         for batch_index in range(len(tokenized_inputs["input_ids"])):
             word_ids = tokenized_inputs.word_ids(batch_index=batch_index)
             org_batch_index = tokenized_inputs["overflow_to_sample_mapping"][batch_index]
@@ -373,10 +409,20 @@ def main():
                         prev_bbox_tuple = wb_tuple
                     word_seg_id.append(seg_counter)
 
+            word_line_id, word_block_id = None, None
+            if getattr(data_args, "use_hpe", False):
+                word_line_id, word_block_id = compute_hierarchical_ids(
+                    bbox,
+                    theta_line=getattr(data_args, "theta_line", 5),
+                    theta_block_x=getattr(data_args, "theta_block_x", 50),
+                    theta_block_y=getattr(data_args, "theta_block_y", 20),
+                )
+
             previous_word_idx = None
             label_ids = []
             bbox_inputs = []
             seg_id_inputs = []  # NEW
+            line_id_inputs, block_id_inputs = [], []
             for word_idx in word_ids:
                 # Special tokens have a word id that is None. We set the label to -100 so they are automatically
                 # ignored in the loss function.
@@ -385,12 +431,18 @@ def main():
                     bbox_inputs.append([0, 0, 0, 0])
                     if word_seg_id is not None:
                         seg_id_inputs.append(-1)  # NEW: not part of any segment
+                    if word_line_id is not None:                     # ==== THÊM MỚI ====
+                        line_id_inputs.append(-1)
+                        block_id_inputs.append(-1)
                 # We set the label for the first token of each word.
                 elif word_idx != previous_word_idx:
                     label_ids.append(label_to_id[label[word_idx]])
                     bbox_inputs.append(bbox[word_idx])
                     if word_seg_id is not None:
                         seg_id_inputs.append(word_seg_id[word_idx])  # NEW
+                    if word_line_id is not None:                     # ==== THÊM MỚI ====
+                        line_id_inputs.append(word_line_id[word_idx])
+                        block_id_inputs.append(word_block_id[word_idx])
                 # For the other tokens in a word, we set the label to either the current label or -100, depending on
                 # the label_all_tokens flag.
                 else:
@@ -398,11 +450,17 @@ def main():
                     bbox_inputs.append(bbox[word_idx])
                     if word_seg_id is not None:
                         seg_id_inputs.append(word_seg_id[word_idx])  # NEW
+                    if word_line_id is not None:                     # ==== THÊM MỚI ====
+                        line_id_inputs.append(word_line_id[word_idx])
+                        block_id_inputs.append(word_block_id[word_idx])
                 previous_word_idx = word_idx
             labels.append(label_ids)
             bboxes.append(bbox_inputs)
             if word_seg_id is not None:
                 seg_ids.append(seg_id_inputs)  # NEW
+            if word_line_id is not None:                             # ==== THÊM MỚI ====
+                line_ids.append(line_id_inputs)
+                block_ids.append(block_id_inputs)
 
             if data_args.visual_embed:
                 ipath = examples["image_path"][org_batch_index]
@@ -415,6 +473,9 @@ def main():
         tokenized_inputs["bbox"] = bboxes
         if getattr(data_args, "use_segment_head", False):
             tokenized_inputs["seg_id"] = seg_ids  # NEW
+        if getattr(data_args, "use_hpe", False):                     # ==== THÊM MỚI ====
+            tokenized_inputs["line_id"] = line_ids
+            tokenized_inputs["block_id"] = block_ids
         if data_args.visual_embed:
             tokenized_inputs["images"] = images
 

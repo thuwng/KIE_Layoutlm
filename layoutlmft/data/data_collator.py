@@ -84,6 +84,8 @@ class DataCollatorForKeyValueExtraction(DataCollatorMixin):
         has_bbox_input = "bbox" in features[0]
         has_position_input = "position_ids" in features[0]
         has_seg_id_input = "seg_id" in features[0]  # NEW: for LayoutLMv3ForSegmentTokenClassification
+        has_line_id_input = "line_id" in features[0]      # THÊM MỚI
+        has_block_id_input = "block_id" in features[0]
         padding_idx=self.tokenizer.pad_token_id
         sequence_length = torch.tensor(batch["input_ids"]).shape[1]
         padding_side = self.tokenizer.padding_side
@@ -98,6 +100,10 @@ class DataCollatorForKeyValueExtraction(DataCollatorMixin):
                 # -1 = "not part of any segment" (padding / special tokens),
                 # must NOT collide with a real segment id (which start at 0).
                 batch["seg_id"] = [seg + [-1] * (sequence_length - len(seg)) for seg in batch["seg_id"]]
+            if has_line_id_input:
+                batch["line_id"] = [lid + [-1] * (sequence_length - len(lid)) for lid in batch["line_id"]]
+            if has_block_id_input:
+                batch["block_id"] = [bid + [-1] * (sequence_length - len(bid)) for bid in batch["block_id"]]
 
         else:
             batch["labels"] = [[self.label_pad_token_id] * (sequence_length - len(label)) + label for label in labels]
@@ -108,6 +114,10 @@ class DataCollatorForKeyValueExtraction(DataCollatorMixin):
                                           + position_id for position_id in batch["position_ids"]]
             if has_seg_id_input:
                 batch["seg_id"] = [[-1] * (sequence_length - len(seg)) + seg for seg in batch["seg_id"]]
+            if has_line_id_input:
+                batch["line_id"] = [[-1] * (sequence_length - len(lid)) + lid for lid in batch["line_id"]]
+            if has_block_id_input:
+                batch["block_id"] = [[-1] * (sequence_length - len(bid)) + bid for bid in batch["block_id"]]
 
         if 'segment_ids' in batch:
             assert 'position_ids' in batch

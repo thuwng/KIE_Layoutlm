@@ -102,6 +102,17 @@ class LayoutLMv3Embeddings(nn.Module):
         self.h_position_embeddings = nn.Embedding(config.max_2d_position_embeddings, config.shape_size)
         self.w_position_embeddings = nn.Embedding(config.max_2d_position_embeddings, config.shape_size)
 
+        self.use_hpe = getattr(config, "use_hpe", False)
+        if self.use_hpe:
+            hpe_dim = getattr(config, "hpe_embedding_size", 32)
+            self.line_id_embeddings = nn.Embedding(getattr(config, "max_line_id", 512), hpe_dim)
+            self.block_id_embeddings = nn.Embedding(getattr(config, "max_block_id", 512), hpe_dim)
+            self.hpe_proj = nn.Linear(hpe_dim * 2, config.hidden_size)
+        else:
+            self.line_id_embeddings = None
+            self.block_id_embeddings = None
+            self.hpe_proj = None
+
     def _calc_spatial_position_embeddings(self, bbox):
         try:
             assert torch.all(0 <= bbox) and torch.all(bbox <= 1023)
@@ -152,6 +163,8 @@ class LayoutLMv3Embeddings(nn.Module):
         position_ids=None,
         inputs_embeds=None,
         past_key_values_length=0,
+        line_id=None,    
+        block_id=None,
     ):
         if position_ids is None:
             if input_ids is not None:
@@ -180,6 +193,17 @@ class LayoutLMv3Embeddings(nn.Module):
         spatial_position_embeddings = self._calc_spatial_position_embeddings(bbox)
 
         embeddings = embeddings + spatial_position_embeddings
+
+        if self.use_hpe and line_id is not None and block_id is not None:
+            line_id_clamped = line_id.clamp(min=0, max=self.line_id_embeddings.num_embeddings - 1)
+            block_id_clamped = block_id.clamp(min=0, max=self.block_id_embeddings.num_embeddings - 1)
+            hpe_feat = torch.cat(
+                [self.line_id_embeddings(line_id_clamped), self.block_id_embeddings(block_id_clamped)],
+                dim=-1,
+            )
+            hpe_feat = self.hpe_proj(hpe_feat)
+            valid_mask = (line_id >= 0).unsqueeze(-1).to(hpe_feat.dtype)
+            embeddings = embeddings + hpe_feat * valid_mask
 
         embeddings = self.LayerNorm(embeddings)
         embeddings = self.dropout(embeddings)
@@ -818,6 +842,8 @@ class LayoutLMv3Model(LayoutLMv3PreTrainedModel):
         output_hidden_states=None,
         return_dict=None,
         images=None,
+        line_id=None,    
+        block_id=None,
     ):
         r"""
         encoder_hidden_states  (:obj:`torch.FloatTensor` of shape :obj:`(batch_size, sequence_length, hidden_size)`, `optional`):
@@ -896,6 +922,8 @@ class LayoutLMv3Model(LayoutLMv3PreTrainedModel):
                 token_type_ids=token_type_ids,
                 inputs_embeds=inputs_embeds,
                 past_key_values_length=past_key_values_length,
+                line_id=line_id,     
+                block_id=block_id,
             )
 
         final_bbox = final_position_ids = None

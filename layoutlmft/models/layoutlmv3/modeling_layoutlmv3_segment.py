@@ -81,9 +81,22 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
         self.is_first_token_embedding = nn.Embedding(2, config.hidden_size)
         nn.init.normal_(self.is_first_token_embedding.weight, mean=0.0, std=0.02)
 
+        # ==== THÊM MỚI: khôi phục 1D order embedding cho chuỗi segment
+        # (đã bị xóa - xem comment "ĐÃ XÓA 1D EMBEDDING Ở ĐÂY" ở bản gốc,
+        # nhưng báo cáo mục 3.3 vẫn mô tả có "Positional Embedding 1D") ====
+        if self.segment_context is not None:
+            self.segment_position_embedding = nn.Embedding(
+                getattr(config, "max_segment_position", 512), config.hidden_size
+            )
+            nn.init.normal_(self.segment_position_embedding.weight, mean=0.0, std=0.02)
+        else:
+            self.segment_position_embedding = None
+
         self.init_weights()
-        # for param in self.layoutlmv3.parameters():
-        #     param.requires_grad = False
+
+        if getattr(self.config, "use_hpe", False) and self.layoutlmv3.embeddings.hpe_proj is not None:
+            nn.init.zeros_(self.layoutlmv3.embeddings.hpe_proj.weight)
+            nn.init.zeros_(self.layoutlmv3.embeddings.hpe_proj.bias)
 
     def _segment_pool_and_contextualize(self, text_hidden, seg_id, bbox):
         B, L, H = text_hidden.shape
@@ -110,12 +123,17 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
                 seg_bboxes[i] = bbox[b, mask][0] # Lấy bbox đại diện cho segment (token đầu tiên)
 
             if self.segment_context is not None:
-                # SỬ DỤNG MODULE 2D EMBEDDING CÓ SẴN CỦA BACKBONE
-                spatial_emb = self.layoutlmv3.embeddings._calc_spatial_position_embeddings(seg_bboxes.unsqueeze(0)).squeeze(0)
-                
-                # Cộng 2D embedding vào đặc trưng của segment
-                seg_vecs_with_pos = seg_vecs + spatial_emb
-                
+                spatial_emb = self.layoutlmv3.embeddings._calc_spatial_position_embeddings(
+                    seg_bboxes.unsqueeze(0)
+                ).squeeze(0)
+
+                # ==== THÊM MỚI: 1D order embedding theo thứ tự đọc (reading order) ====
+                order_ids = torch.arange(n_seg, device=device).clamp(
+                    max=self.segment_position_embedding.num_embeddings - 1
+                )
+                order_emb = self.segment_position_embedding(order_ids)
+
+                seg_vecs_with_pos = seg_vecs + spatial_emb + order_emb  # trước đây thiếu order_emb
                 ctx_out = self.segment_context(seg_vecs_with_pos.unsqueeze(0)).squeeze(0)
                 seg_vecs_ctx = seg_vecs + self.segment_context_gate * (ctx_out - seg_vecs)
             else:
@@ -138,6 +156,8 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
         inputs_embeds=None,
         labels=None,
         seg_id=None,  # NEW input: (batch, text_seq_len), see docstring above
+        line_id=None,      # ==== THÊM MỚI ====
+        block_id=None,
         output_attentions=None,
         output_hidden_states=None,
         return_dict=None,
@@ -158,6 +178,8 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
             return_dict=return_dict,
             images=images,
             valid_span=valid_span,
+            line_id=line_id,      # ==== THÊM MỚI ====
+            block_id=block_id,
         )
 
         sequence_output = outputs[0]  # (B, text_len + image_len, H)
