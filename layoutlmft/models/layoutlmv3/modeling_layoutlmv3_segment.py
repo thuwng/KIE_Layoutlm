@@ -101,6 +101,11 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
         self.segment_attn_query = nn.Linear(config.hidden_size, config.hidden_size)
         self.segment_attn_proj = nn.Linear(config.hidden_size, 1)
 
+        nn.init.normal_(self.segment_attn_query.weight, mean=0.0, std=0.02)
+        nn.init.zeros_(self.segment_attn_query.bias)
+        nn.init.zeros_(self.segment_attn_proj.weight)
+        nn.init.zeros_(self.segment_attn_proj.bias)
+
     def _segment_pool_and_contextualize(self, text_hidden, seg_id):
         B, L, H = text_hidden.shape
         device = text_hidden.device
@@ -128,9 +133,7 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
                 # score shape: (num_tokens_in_seg, 1)
                 score = self.segment_attn_proj(torch.tanh(self.segment_attn_query(token_feats)))
                 attn_weights = torch.softmax(score, dim=0) # Chuẩn hóa trọng số tổng bằng 1
-                # Sau khi tính attn_weights trong vòng lặp segment:
-                if torch.rand(1).item() < 0.01: # In ngẫu nhiên 1% số lần để tránh ngập terminal
-                    print("Sample attn weights max/min:", attn_weights.max().item(), attn_weights.min().item())
+                
                 # Vector đại diện segment là tổng có trọng số (weighted sum) thay vì mean pooling
                 seg_vecs[i] = torch.sum(token_feats * attn_weights, dim=0)
 
