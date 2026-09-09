@@ -570,6 +570,12 @@ def main():
                 new_decay = [p for n, p in self.model.named_parameters() if "layoutlmv3" not in n and not any(nd in n for nd in no_decay) and p.requires_grad]
                 new_nodecay = [p for n, p in self.model.named_parameters() if "layoutlmv3" not in n and any(nd in n for nd in no_decay) and p.requires_grad]
 
+                num_backbone = sum(p.numel() for p in backbone_decay + backbone_nodecay)
+                num_new = sum(p.numel() for p in new_decay + new_nodecay)
+                print(f"👉 [Optimizer Debug] Số lượng tham số Backbone: {num_backbone:,}")
+                print(f"👉 [Optimizer Debug] Số lượng tham số Module mới (Attention Pooling, Segment, v.v.): {num_new:,}")
+                # ============================================================
+
                 optimizer_grouped_parameters = [
                     # Backbone (LayoutLMv3 gốc): LR thấp
                     {"params": backbone_decay, "lr": self.args.learning_rate, "weight_decay": self.args.weight_decay},
