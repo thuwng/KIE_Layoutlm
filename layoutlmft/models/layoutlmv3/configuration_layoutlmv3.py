@@ -51,7 +51,21 @@ class LayoutLMv3Config(BertConfig):
     ):
         """Constructs RobertaConfig."""
         super().__init__(pad_token_id=pad_token_id, bos_token_id=bos_token_id, eos_token_id=eos_token_id, **kwargs)
-        ...
+        self.max_2d_position_embeddings = max_2d_position_embeddings
+        self.coordinate_size = coordinate_size
+        self.shape_size = shape_size
+        self.has_relative_attention_bias = has_relative_attention_bias
+        self.rel_pos_bins = rel_pos_bins
+        self.max_rel_pos = max_rel_pos
+        self.has_spatial_attention_bias = has_spatial_attention_bias
+        self.rel_2d_pos_bins = rel_2d_pos_bins
+        self.max_rel_2d_pos = max_rel_2d_pos
+        self.visual_embed = visual_embed
+        self.mim = mim
+        self.wpa_task = wpa_task
+        self.discrete_vae_weight_path = discrete_vae_weight_path
+        self.discrete_vae_type = discrete_vae_type
+        self.input_size = input_size
         self.second_input_size = second_input_size
         self.device = device
         # ==== THÊM MỚI ====
