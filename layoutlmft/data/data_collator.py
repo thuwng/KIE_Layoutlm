@@ -89,6 +89,8 @@ class DataCollatorForKeyValueExtraction(DataCollatorMixin):
         padding_idx=self.tokenizer.pad_token_id
         sequence_length = torch.tensor(batch["input_ids"]).shape[1]
         padding_side = self.tokenizer.padding_side
+        has_is_first = "is_first" in features[0]
+
         if padding_side == "right":
             batch["labels"] = [label + [self.label_pad_token_id] * (sequence_length - len(label)) for label in labels]
             if has_bbox_input:
@@ -102,6 +104,8 @@ class DataCollatorForKeyValueExtraction(DataCollatorMixin):
                 batch["line_id"] = [lid + [-1] * (sequence_length - len(lid)) for lid in batch["line_id"]]
             if has_block_id_input:
                 batch["block_id"] = [bid + [-1] * (sequence_length - len(bid)) for bid in batch["block_id"]]
+            if has_is_first:
+                batch["is_first"] = [isf + [0] * (sequence_length - len(isf)) for isf in batch["is_first"]]
         else:
             batch["labels"] = [[self.label_pad_token_id] * (sequence_length - len(label)) + label for label in labels]
             if has_bbox_input:
@@ -115,6 +119,8 @@ class DataCollatorForKeyValueExtraction(DataCollatorMixin):
                 batch["line_id"] = [lid + [-1] * (sequence_length - len(lid)) for lid in batch["line_id"]]
             if has_block_id_input:
                 batch["block_id"] = [bid + [-1] * (sequence_length - len(bid)) for bid in batch["block_id"]]
+            if has_is_first:
+                batch["is_first"] = [[0] * (sequence_length - len(isf)) + isf for isf in batch["is_first"]]
 
         if 'segment_ids' in batch:
             assert 'position_ids' in batch

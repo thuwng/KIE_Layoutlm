@@ -380,6 +380,7 @@ def main():
         seg_ids = []
         line_ids = []
         block_ids = []
+        is_first_batch = []
 
         for batch_index in range(len(tokenized_inputs["input_ids"])):
             word_ids = tokenized_inputs.word_ids(batch_index=batch_index)
@@ -410,12 +411,24 @@ def main():
                     theta_block_y=getattr(data_args, "theta_block_y", 20),
                 )
 
+            word_is_first = []
+            prev_bbox_tuple_for_first = None
+            for wb in bbox:
+                wb_tup = tuple(wb)
+                if wb_tup != prev_bbox_tuple_for_first:
+                    word_is_first.append(1)
+                    prev_bbox_tuple_for_first = wb_tup
+                else:
+                    word_is_first.append(0)
+
             previous_word_idx = None
             label_ids = []
             bbox_inputs = []
             seg_id_inputs = []
             line_id_inputs = []
             block_id_inputs = []
+            is_first_inputs = [] 
+            seen_words = set()
 
             for word_idx in word_ids:
                 if word_idx is None:
@@ -424,7 +437,15 @@ def main():
                     seg_id_inputs.append(-1)
                     line_id_inputs.append(-1)
                     block_id_inputs.append(-1)
+                    is_first_inputs.append(0)
                 else:
+                    # Map chuẩn xác vào chunk: chỉ subword đầu tiên của từ ĐẦU TIÊN trong segment mới là is_first=1
+                    if word_idx not in seen_words:
+                        seen_words.add(word_idx)
+                        is_first_inputs.append(word_is_first[word_idx])
+                    else:
+                        is_first_inputs.append(0)
+
                     # Map chính xác segment ID, line ID, block ID từ word sang subword tokens
                     s_id = word_seg_ids[word_idx] if word_seg_ids else -1
                     l_id = word_line_id[word_idx] if word_line_id else -1
@@ -461,6 +482,7 @@ def main():
         tokenized_inputs["bbox"] = bboxes
         if getattr(data_args, "use_segment_head", False):
             tokenized_inputs["seg_id"] = seg_ids
+            tokenized_inputs["is_first"] = is_first_batch
         if getattr(data_args, "use_hpe", False):
             tokenized_inputs["line_id"] = line_ids
             tokenized_inputs["block_id"] = block_ids
@@ -577,12 +599,12 @@ def main():
                 # ============================================================
 
                 optimizer_grouped_parameters = [
-                    # Backbone (LayoutLMv3 gốc): LR thấp
+                    # Backbone (LayoutLMv3 gốc)
                     {"params": backbone_decay, "lr": self.args.learning_rate, "weight_decay": self.args.weight_decay},
                     {"params": backbone_nodecay, "lr": self.args.learning_rate, "weight_decay": 0.0},
-                    # Module mới (Segment, Gate, Classifier): LR cao
-                    {"params": new_decay, "lr": 5e-4, "weight_decay": self.args.weight_decay},
-                    {"params": new_nodecay, "lr": 5e-4, "weight_decay": 0.0}
+                    # Module mới (Segment, Gate, Classifier): Đồng bộ LR với backbone hoặc bạn có thể nhân 2 nếu muốn warm-up nhẹ
+                    {"params": new_decay, "lr": self.args.learning_rate, "weight_decay": self.args.weight_decay},
+                    {"params": new_nodecay, "lr": self.args.learning_rate, "weight_decay": 0.0}
                 ]
                 
                 self.optimizer = torch.optim.AdamW(

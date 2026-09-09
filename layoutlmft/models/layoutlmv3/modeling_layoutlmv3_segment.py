@@ -92,6 +92,7 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
         else:
             self.segment_position_embedding = None
 
+        self.token_gate = nn.Parameter(torch.zeros(config.hidden_size))
         self.init_weights()
 
         if getattr(self.config, "use_hpe", False) and self.layoutlmv3.embeddings.hpe_proj is not None:
@@ -106,7 +107,7 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
         nn.init.zeros_(self.segment_attn_proj.weight)
         nn.init.zeros_(self.segment_attn_proj.bias)
 
-    def _segment_pool_and_contextualize(self, text_hidden, seg_id):
+    def _segment_pool_and_contextualize(self, text_hidden, seg_id, text_bbox):
         B, L, H = text_hidden.shape
         device = text_hidden.device
         broadcast_hidden = text_hidden.clone()
@@ -121,37 +122,44 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
             n_seg = uniq_segs.shape[0]
 
             seg_vecs = torch.zeros(n_seg, H, device=device, dtype=text_hidden.dtype)
+            seg_bboxes = torch.zeros(n_seg, 4, device=device, dtype=torch.long) # Hộp bao ngoài cho không gian
             seg_masks = []
 
             for i, s in enumerate(uniq_segs):
                 mask = ids == s
                 seg_masks.append(mask)
-                token_feats = text_hidden[b, mask]  # Shape: (num_tokens_in_seg, H)
+                token_feats = text_hidden[b, mask]
                 
-                # ---- ADAPTIVE ATTENTION POOLING LOGIC ----
-                # Tính điểm attention cho các token trong segment
-                # score shape: (num_tokens_in_seg, 1)
+                # Bbox của segment: Lấy tọa độ min (trái, trên) và max (phải, dưới)
+                seg_box = text_bbox[b, mask]
+                seg_bboxes[i, 0] = seg_box[:, 0].min()
+                seg_bboxes[i, 1] = seg_box[:, 1].min()
+                seg_bboxes[i, 2] = seg_box[:, 2].max()
+                seg_bboxes[i, 3] = seg_box[:, 3].max()
+
+                # Attention Pooling
                 score = self.segment_attn_proj(torch.tanh(self.segment_attn_query(token_feats)))
-                attn_weights = torch.softmax(score, dim=0) # Chuẩn hóa trọng số tổng bằng 1
-                
-                # Vector đại diện segment là tổng có trọng số (weighted sum) thay vì mean pooling
+                attn_weights = torch.softmax(score, dim=0) 
                 seg_vecs[i] = torch.sum(token_feats * attn_weights, dim=0)
 
             if self.segment_context is not None:
-                # 1D order embedding theo thứ tự đọc (reading order)
-                order_ids = torch.arange(n_seg, device=device).clamp(
-                    max=self.segment_position_embedding.num_embeddings - 1
-                )
+                order_ids = torch.arange(n_seg, device=device).clamp(max=self.segment_position_embedding.num_embeddings - 1)
                 order_emb = self.segment_position_embedding(order_ids)
 
-                seg_vecs_with_pos = seg_vecs + order_emb
+                # Dùng chính bộ mã hoá không gian tuyệt đối 2D của LayoutLMv3 cho segment!
+                # Điều này giúp mạng Segment Context hiểu chính xác tương quan gần/xa, trên/dưới.
+                spatial_emb = self.layoutlmv3.embeddings._calc_spatial_position_embeddings(seg_bboxes.unsqueeze(0)).squeeze(0)
+
+                # Cộng cả vector thứ tự đọc và tọa độ không gian vào đại diện của segment
+                seg_vecs_with_pos = seg_vecs + order_emb + spatial_emb
                 ctx_out = self.segment_context(seg_vecs_with_pos.unsqueeze(0)).squeeze(0)
                 seg_vecs_ctx = seg_vecs + self.segment_context_gate * (ctx_out - seg_vecs)
             else:
                 seg_vecs_ctx = seg_vecs
 
             for i, mask in enumerate(seg_masks):
-                broadcast_hidden[b, mask] = seg_vecs_ctx[i]
+                # THAY ĐỔI LỚN (Priority 2): Sử dụng Residual Injection thay vì Overwrite
+                broadcast_hidden[b, mask] = text_hidden[b, mask] + self.token_gate * (seg_vecs_ctx[i] - text_hidden[b, mask])
 
         return broadcast_hidden
     
@@ -167,6 +175,7 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
         inputs_embeds=None,
         labels=None,
         seg_id=None,  # NEW input: (batch, text_seq_len), see docstring above
+        is_first=None,
         line_id=None,      # ==== THÊM MỚI ====
         block_id=None,
         output_attentions=None,
@@ -199,24 +208,14 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
         image_hidden = sequence_output[:, text_len:, :]
 
         if seg_id is not None:
-            # Truyền thêm tham số bbox (chỉ lấy phần của text)
-            text_hidden = self._segment_pool_and_contextualize(text_hidden, seg_id)
+            # Truyền thêm text_bbox vào hàm pooling (chỉ lấy phần của text)
+            text_bbox = bbox[:, :text_len, :]
+            text_hidden = self._segment_pool_and_contextualize(text_hidden, seg_id, text_bbox)
 
-            # Add the is-first-token-of-segment signal so the classifier can
-            # still distinguish B- from I- despite the shared pooled vector.
-            is_first = torch.zeros_like(seg_id, dtype=torch.long)
-            is_first[:, 0] = 0  # position 0 is always a special token ([CLS]) -> irrelevant, seg_id=-1 there anyway
-            if seg_id.shape[1] > 1:
-                prev = seg_id[:, :-1]
-                cur = seg_id[:, 1:]
-                changed = (cur != prev) & (cur >= 0)
-                is_first[:, 1:] = changed.long()
-            # A token whose seg_id == -1 (special/pad) is never "first of a segment".
-            is_first = is_first * (seg_id >= 0).long()
-
-            text_hidden = text_hidden + self.is_first_token_embedding(is_first)
-        # if seg_id is None (e.g. an old checkpoint / different dataloader),
-        # fall back to plain per-token behavior -- text_hidden is untouched.
+            # Cấp nhãn B-/I- chuẩn xác bằng dữ liệu đã chuẩn bị trước chunking
+            if is_first is not None:
+                # Padding token có seg_id = -1 sẽ có is_first = 0
+                text_hidden = text_hidden + self.is_first_token_embedding(is_first)
 
         if image_hidden.shape[1] > 0:
             pooled_sequence = torch.cat([text_hidden, image_hidden], dim=1)
