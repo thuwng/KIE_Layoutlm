@@ -511,14 +511,15 @@ def main():
     class CustomTrainer(Trainer):
         def create_optimizer(self):
             if self.optimizer is None:
-                decay_parameters = self.get_decay_parameter_names(self.model)
+                # Định nghĩa thủ công các tham số không dùng weight decay
+                no_decay = ["bias", "LayerNorm.weight", "layer_norm.weight"]
                 
-                # Phân tách 4 nhóm tham số
-                backbone_decay = [p for n, p in self.model.named_parameters() if "layoutlmv3" in n and n in decay_parameters and p.requires_grad]
-                backbone_nodecay = [p for n, p in self.model.named_parameters() if "layoutlmv3" in n and n not in decay_parameters and p.requires_grad]
+                # Phân tách 4 nhóm tham số bằng cách check chuỗi trực tiếp
+                backbone_decay = [p for n, p in self.model.named_parameters() if "layoutlmv3" in n and not any(nd in n for nd in no_decay) and p.requires_grad]
+                backbone_nodecay = [p for n, p in self.model.named_parameters() if "layoutlmv3" in n and any(nd in n for nd in no_decay) and p.requires_grad]
                 
-                new_decay = [p for n, p in self.model.named_parameters() if "layoutlmv3" not in n and n in decay_parameters and p.requires_grad]
-                new_nodecay = [p for n, p in self.model.named_parameters() if "layoutlmv3" not in n and n not in decay_parameters and p.requires_grad]
+                new_decay = [p for n, p in self.model.named_parameters() if "layoutlmv3" not in n and not any(nd in n for nd in no_decay) and p.requires_grad]
+                new_nodecay = [p for n, p in self.model.named_parameters() if "layoutlmv3" not in n and any(nd in n for nd in no_decay) and p.requires_grad]
 
                 optimizer_grouped_parameters = [
                     # Backbone (LayoutLMv3 gốc): LR thấp
