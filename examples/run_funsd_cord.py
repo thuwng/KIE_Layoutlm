@@ -467,6 +467,7 @@ def main():
             bboxes.append(bbox_inputs)
             if getattr(data_args, "use_segment_head", False):
                 seg_ids.append(seg_id_inputs)
+                is_first_batch.append(is_first_inputs)
             if getattr(data_args, "use_hpe", False):
                 line_ids.append(line_id_inputs)
                 block_ids.append(block_id_inputs)
