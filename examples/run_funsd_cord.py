@@ -604,8 +604,8 @@ def main():
                     {"params": backbone_decay, "lr": self.args.learning_rate, "weight_decay": self.args.weight_decay},
                     {"params": backbone_nodecay, "lr": self.args.learning_rate, "weight_decay": 0.0},
                     # Module mới (Segment, Gate, Classifier): Đồng bộ LR với backbone hoặc bạn có thể nhân 2 nếu muốn warm-up nhẹ
-                    {"params": new_decay, "lr": self.args.learning_rate, "weight_decay": self.args.weight_decay},
-                    {"params": new_nodecay, "lr": self.args.learning_rate, "weight_decay": 0.0}
+                    {"params": new_decay, "lr": 5e-4, "weight_decay": self.args.weight_decay},
+                    {"params": new_nodecay, "lr": 5e-4, "weight_decay": 0.0}
                 ]
                 
                 self.optimizer = torch.optim.AdamW(
