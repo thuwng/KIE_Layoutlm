@@ -155,6 +155,13 @@ class DataTrainingArguments:
             "and feed them into LayoutLMv3ForSegmentTokenClassification. Requires --use_segment_head."
         },
     )
+    segment_aux_loss_weight: float = field(
+        default=0.3,
+        metadata={
+            "help": "Weight of the auxiliary segment-level entity-type loss (Bước 2) added to "
+            "the main token classification loss. 0 disables it entirely."
+        },
+    )
     data_dir: Optional[str] = field(default=None)
     input_size: int = field(default=224, metadata={"help": "images input size for backbone"})
     second_input_size: int = field(default=112, metadata={"help": "images input size for discrete vae"})
@@ -274,6 +281,13 @@ def main():
         input_size=data_args.input_size,
         use_auth_token=True if model_args.use_auth_token else None,
         use_hpe=getattr(data_args, "use_hpe", False),
+        # NEW: bắt buộc cho aux segment loss (Bước 2) — nếu không truyền,
+        # HF tự sinh id2label giả dạng "LABEL_0","LABEL_1",... khiến hàm
+        # gộp "B-QUESTION"/"I-QUESTION" -> "QUESTION" trong
+        # modeling_layoutlmv3_segment.py mất tác dụng.
+        id2label={i: l for i, l in enumerate(label_list)},
+        label2id={l: i for i, l in enumerate(label_list)},
+        segment_aux_loss_weight=getattr(data_args, "segment_aux_loss_weight", 0.3),
     )
     tokenizer = AutoTokenizer.from_pretrained(
         model_args.tokenizer_name if model_args.tokenizer_name else model_args.model_name_or_path,
@@ -624,6 +638,11 @@ def main():
             
             if hasattr(model, "segment_context_gate") and model.segment_context_gate is not None:
                 logs["segment_context_gate_mean"] = model.segment_context_gate.data.mean().item()
+
+            # NEW (Bước 2): theo dõi aux loss để biết segment_context có
+            # đang thực sự học được gì không (nên giảm dần theo step).
+            if getattr(model, "_last_aux_seg_loss", None) is not None:
+                logs["segment_aux_loss"] = model._last_aux_seg_loss.item()
 
             # Bạn có thể thêm bất kỳ tham số nào khác cần theo dõi ở đây
             

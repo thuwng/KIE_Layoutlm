@@ -107,13 +107,57 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
         nn.init.zeros_(self.segment_attn_proj.weight)
         nn.init.zeros_(self.segment_attn_proj.bias)
 
-    def _segment_pool_and_contextualize(self, text_hidden, seg_id, text_bbox):
+        # ---- NEW (Bước 2): auxiliary segment-level loss ----
+        # Vấn đề: aux/token gate bị "kẹt" ở ~0 vì nhánh classifier chính (trên
+        # text_hidden thô) đã đủ sức fit train loss một mình -> không có áp
+        # lực gradient nào buộc segment_context phải học điều gì hữu ích.
+        # Fix: gắn thêm 1 classifier NHỎ ngay trên seg_vecs_ctx (vector đã
+        # qua Transformer liên-segment, TRƯỚC khi bị token_gate làm loãng),
+        # dự đoán LOẠI THỰC THỂ (entity type, bỏ tiền tố B-/I-) của cả segment.
+        # Loss này cộng thêm vào loss chính -> gradient đi thẳng vào
+        # segment_context_gate + segment_context + segment_attn_* mà KHÔNG
+        # cần đợi token_gate mở trước. Đây là con đường tắt để nhánh mới
+        # buộc phải học, độc lập với nhánh baseline.
+        id2label = getattr(config, "id2label", None)
+        if id2label is not None and self.segment_context is not None:
+            def _entity_type(label_name):
+                # "B-QUESTION"/"I-QUESTION" -> "QUESTION"; "O" -> "O"
+                return label_name.split("-", 1)[1] if "-" in label_name else label_name
+
+            type_names = sorted({_entity_type(name) for name in id2label.values()})
+            self.entity_type2id = {t: i for i, t in enumerate(type_names)}
+            self.num_entity_types = len(type_names)
+
+            max_label_id = max(int(k) for k in id2label.keys())
+            label_id2type_id = torch.full((max_label_id + 1,), -100, dtype=torch.long)
+            for lid, name in id2label.items():
+                label_id2type_id[int(lid)] = self.entity_type2id[_entity_type(name)]
+            # buffer (không phải Parameter): không train, chỉ để tra cứu, tự
+            # theo device của model khi .to(device)/.cuda() được gọi.
+            self.register_buffer("label_id2type_id", label_id2type_id, persistent=False)
+
+            self.segment_aux_classifier = nn.Linear(config.hidden_size, self.num_entity_types)
+            nn.init.normal_(self.segment_aux_classifier.weight, mean=0.0, std=0.02)
+            nn.init.zeros_(self.segment_aux_classifier.bias)
+            self.segment_aux_loss_weight = getattr(config, "segment_aux_loss_weight", 0.3)
+        else:
+            # Không có id2label hợp lệ, hoặc segment_context đã tắt (seg_ctx_layers=0)
+            # -> bỏ qua an toàn, không aux loss, hành vi y hệt trước đây.
+            self.segment_aux_classifier = None
+
+    def _segment_pool_and_contextualize(self, text_hidden, seg_id, text_bbox, is_first=None, labels=None):
         B, L, H = text_hidden.shape
         device = text_hidden.device
         if is_first is not None:
             text_hidden = text_hidden + self.is_first_token_embedding(is_first)
 
         broadcast_hidden = text_hidden.clone()
+
+        # NEW (Bước 2): gom logits/nhãn phụ cấp-segment qua toàn batch để
+        # tính 1 CrossEntropyLoss duy nhất ở cuối hàm (rẻ hơn nhiều so với
+        # tính loss riêng từng segment).
+        all_aux_logits = []
+        all_aux_targets = []
 
         for b in range(B):
             ids = seg_id[b]
@@ -160,11 +204,34 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
             else:
                 seg_vecs_ctx = seg_vecs
 
+            # NEW (Bước 2): supervise seg_vecs_ctx trực tiếp bằng loại thực
+            # thể (entity type) của segment, lấy majority-vote trên các
+            # token hợp lệ (label != -100) trong segment đó.
+            if self.segment_aux_classifier is not None and labels is not None:
+                seg_targets = torch.full((n_seg,), -100, dtype=torch.long, device=device)
+                for i, mask in enumerate(seg_masks):
+                    seg_label_ids = labels[b, mask]
+                    valid_lbl = seg_label_ids[seg_label_ids != -100]
+                    if valid_lbl.numel() > 0:
+                        type_ids = self.label_id2type_id.to(device)[valid_lbl]
+                        seg_targets[i] = torch.mode(type_ids).values
+                valid_seg = seg_targets != -100
+                if valid_seg.any():
+                    aux_logits = self.segment_aux_classifier(seg_vecs_ctx[valid_seg])
+                    all_aux_logits.append(aux_logits)
+                    all_aux_targets.append(seg_targets[valid_seg])
+
             for i, mask in enumerate(seg_masks):
                 # THAY ĐỔI LỚN (Priority 2): Sử dụng Residual Injection thay vì Overwrite
                 broadcast_hidden[b, mask] = text_hidden[b, mask] + self.token_gate * (seg_vecs_ctx[i] - text_hidden[b, mask])
 
-        return broadcast_hidden
+        aux_loss = None
+        if self.segment_aux_classifier is not None and len(all_aux_logits) > 0:
+            aux_logits_cat = torch.cat(all_aux_logits, dim=0)
+            aux_targets_cat = torch.cat(all_aux_targets, dim=0)
+            aux_loss = CrossEntropyLoss()(aux_logits_cat, aux_targets_cat)
+
+        return broadcast_hidden, aux_loss
     
     def forward(
         self,
@@ -210,10 +277,13 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
         text_hidden = sequence_output[:, :text_len, :]
         image_hidden = sequence_output[:, text_len:, :]
 
+        aux_seg_loss = None
         if seg_id is not None:
             text_bbox = bbox[:, :text_len, :]
-            # [SỬA]: Truyền thẳng is_first vào bên trong hàm
-            text_hidden = self._segment_pool_and_contextualize(text_hidden, seg_id, text_bbox, is_first=is_first)
+            # [SỬA]: Truyền thẳng is_first + labels vào bên trong hàm
+            text_hidden, aux_seg_loss = self._segment_pool_and_contextualize(
+                text_hidden, seg_id, text_bbox, is_first=is_first, labels=labels
+            )
             # Bỏ phần cộng is_first ở bên ngoài đi
 
         if image_hidden.shape[1] > 0:
@@ -237,6 +307,14 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
             else:
                 loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
 
+            # NEW (Bước 2): cộng thêm aux loss cấp-segment.
+            # Đây chính là "áp lực gradient" ép segment_context_gate,
+            # segment_context và segment_attn_* phải học, thay vì bị bỏ
+            # quên ở gần 0 như trước.
+            if aux_seg_loss is not None:
+                loss = loss + self.segment_aux_loss_weight * aux_seg_loss
+                self._last_aux_seg_loss = aux_seg_loss.detach()  # để CustomTrainer.log() đọc, xem bước log bên dưới
+
         if not return_dict:
             output = (logits,) + outputs[2:]
             return ((loss,) + output) if loss is not None else output
@@ -247,3 +325,4 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
+    
