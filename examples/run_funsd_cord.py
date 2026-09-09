@@ -615,6 +615,22 @@ def main():
                 )
             return self.optimizer
 
+        def log(self, logs: dict) -> None:
+            # Lấy reference tới model (xử lý cả trường hợp dùng DataParallel/Distributed)
+            model = self.model.module if hasattr(self.model, "module") else self.model
+            
+            # Đọc giá trị trung bình (mean) hoặc max/min của các cổng (gates) để xem nó đang "học" thế nào
+            if hasattr(model, "token_gate") and model.token_gate is not None:
+                logs["token_gate_mean"] = model.token_gate.data.mean().item()
+            
+            if hasattr(model, "segment_context_gate") and model.segment_context_gate is not None:
+                logs["segment_context_gate_mean"] = model.segment_context_gate.data.mean().item()
+
+            # Bạn có thể thêm bất kỳ tham số nào khác cần theo dõi ở đây
+            
+            # Gọi hàm log gốc để ghi vào file trainer_state.json và in ra console
+            super().log(logs)
+
     # Khởi tạo Trainer bằng CustomTrainer vừa tạo thay vì Trainer mặc định
     trainer = CustomTrainer(
         model=model,
@@ -663,6 +679,46 @@ def main():
 
         trainer.log_metrics("eval", metrics)
         trainer.save_metrics("eval", metrics)
+
+        # ==== THÊM MỚI: TRÍCH XUẤT VÀ LƯU FILE PHÂN TÍCH LỖI ====
+        logger.info("*** Error Analysis on Eval Set ***")
+        # Gọi predict trên tập eval để lấy logits
+        eval_preds = trainer.predict(eval_dataset)
+        pred_logits = eval_preds.predictions
+        pred_labels = np.argmax(pred_logits, axis=2)
+        true_labels = eval_preds.label_ids
+        input_ids = eval_dataset["input_ids"]
+
+        error_file = os.path.join(training_args.output_dir, "eval_error_analysis.txt")
+        if trainer.is_world_process_zero():
+            with open(error_file, "w", encoding="utf-8") as f:
+                f.write("--- THỐNG KÊ CÁC TOKEN DỰ ĐOÁN SAI TRÊN TẬP EVAL ---\n\n")
+                
+                # Duyệt qua từng văn bản (document) trong batch
+                for i in range(len(pred_labels)):
+                    doc_has_error = False
+                    doc_errors = []
+                    
+                    # Duyệt qua từng token trong văn bản
+                    for p, l, tok_id in zip(pred_labels[i], true_labels[i], input_ids[i]):
+                        if l != -100:  # Bỏ qua các token padding hoặc token bị ẩn (-100)
+                            t_lbl = label_list[l]
+                            p_lbl = label_list[p]
+                            
+                            # Nếu dự đoán sai
+                            if t_lbl != p_lbl:
+                                doc_has_error = True
+                                # Giải mã (decode) token ID ngược lại thành chữ
+                                token_str = tokenizer.decode([tok_id]).strip()
+                                doc_errors.append(f"Token: {token_str:<20} | Nhãn Thật: {t_lbl:<15} | Dự Đoán: {p_lbl:<15}")
+                    
+                    # Chỉ ghi vào file những document có lỗi để dễ theo dõi
+                    if doc_has_error:
+                        f.write(f"=== Document {i} ===\n")
+                        f.write("\n".join(doc_errors) + "\n\n")
+                        
+        logger.info(f"Đã lưu chi tiết lỗi tại: {error_file}")
+        # ========================================================
 
     # Predict
     if training_args.do_predict:
