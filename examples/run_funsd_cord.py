@@ -583,8 +583,7 @@ def main():
     class CustomTrainer(Trainer):
         def create_optimizer(self):
             if self.optimizer is None:
-                # Định nghĩa thủ công các tham số không dùng weight decay
-                no_decay = ["bias", "LayerNorm.weight", "layer_norm.weight"]
+                no_decay = ["bias", "LayerNorm.weight", "layer_norm.weight", "gate", "is_first_token_embedding", "segment_position_embedding"]
                 
                 # Phân tách 4 nhóm tham số bằng cách check chuỗi trực tiếp
                 backbone_decay = [p for n, p in self.model.named_parameters() if "layoutlmv3" in n and not any(nd in n for nd in no_decay) and p.requires_grad]

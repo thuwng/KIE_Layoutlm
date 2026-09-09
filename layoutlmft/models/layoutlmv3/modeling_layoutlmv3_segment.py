@@ -96,7 +96,7 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
         self.init_weights()
 
         if getattr(self.config, "use_hpe", False) and self.layoutlmv3.embeddings.hpe_proj is not None:
-            nn.init.zeros_(self.layoutlmv3.embeddings.hpe_proj.weight)
+            nn.init.normal_(self.layoutlmv3.embeddings.hpe_proj.weight, mean=0.0, std=0.02)
             nn.init.zeros_(self.layoutlmv3.embeddings.hpe_proj.bias)
 
         self.segment_attn_query = nn.Linear(config.hidden_size, config.hidden_size)
@@ -110,6 +110,9 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
     def _segment_pool_and_contextualize(self, text_hidden, seg_id, text_bbox):
         B, L, H = text_hidden.shape
         device = text_hidden.device
+        if is_first is not None:
+            text_hidden = text_hidden + self.is_first_token_embedding(is_first)
+
         broadcast_hidden = text_hidden.clone()
 
         for b in range(B):
@@ -208,14 +211,10 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
         image_hidden = sequence_output[:, text_len:, :]
 
         if seg_id is not None:
-            # Truyền thêm text_bbox vào hàm pooling (chỉ lấy phần của text)
             text_bbox = bbox[:, :text_len, :]
-            text_hidden = self._segment_pool_and_contextualize(text_hidden, seg_id, text_bbox)
-
-            # Cấp nhãn B-/I- chuẩn xác bằng dữ liệu đã chuẩn bị trước chunking
-            if is_first is not None:
-                # Padding token có seg_id = -1 sẽ có is_first = 0
-                text_hidden = text_hidden + self.is_first_token_embedding(is_first)
+            # [SỬA]: Truyền thẳng is_first vào bên trong hàm
+            text_hidden = self._segment_pool_and_contextualize(text_hidden, seg_id, text_bbox, is_first=is_first)
+            # Bỏ phần cộng is_first ở bên ngoài đi
 
         if image_hidden.shape[1] > 0:
             pooled_sequence = torch.cat([text_hidden, image_hidden], dim=1)
