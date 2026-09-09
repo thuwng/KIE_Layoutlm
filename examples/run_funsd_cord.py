@@ -411,8 +411,9 @@ def main():
 
             word_line_id, word_block_id = None, None
             if getattr(data_args, "use_hpe", False):
+                raw_bbox_for_hpe = examples.get("raw_bboxes", examples["bboxes"])[org_batch_index]
                 word_line_id, word_block_id = compute_hierarchical_ids(
-                    bbox,
+                    raw_bbox_for_hpe,
                     theta_line=getattr(data_args, "theta_line", 5),
                     theta_block_x=getattr(data_args, "theta_block_x", 50),
                     theta_block_y=getattr(data_args, "theta_block_y", 20),
