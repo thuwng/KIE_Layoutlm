@@ -97,14 +97,11 @@ class DataCollatorForKeyValueExtraction(DataCollatorMixin):
                 batch["position_ids"] = [position_id + [padding_idx] * (sequence_length - len(position_id))
                                           for position_id in batch["position_ids"]]
             if has_seg_id_input:
-                # -1 = "not part of any segment" (padding / special tokens),
-                # must NOT collide with a real segment id (which start at 0).
                 batch["seg_id"] = [seg + [-1] * (sequence_length - len(seg)) for seg in batch["seg_id"]]
             if has_line_id_input:
                 batch["line_id"] = [lid + [-1] * (sequence_length - len(lid)) for lid in batch["line_id"]]
             if has_block_id_input:
                 batch["block_id"] = [bid + [-1] * (sequence_length - len(bid)) for bid in batch["block_id"]]
-
         else:
             batch["labels"] = [[self.label_pad_token_id] * (sequence_length - len(label)) + label for label in labels]
             if has_bbox_input:
@@ -113,11 +110,11 @@ class DataCollatorForKeyValueExtraction(DataCollatorMixin):
                 batch["position_ids"] = [[padding_idx] * (sequence_length - len(position_id))
                                           + position_id for position_id in batch["position_ids"]]
             if has_seg_id_input:
-                batch["seg_id"] = [[-1] * (sequence_length - len(seg)) + seg for seg in batch["seg_id"]]
+                batch["seg_id"] = [seg + [-1] * (sequence_length - len(seg)) for seg in batch["seg_id"]]
             if has_line_id_input:
-                batch["line_id"] = [[-1] * (sequence_length - len(lid)) + lid for lid in batch["line_id"]]
+                batch["line_id"] = [lid + [-1] * (sequence_length - len(lid)) for lid in batch["line_id"]]
             if has_block_id_input:
-                batch["block_id"] = [[-1] * (sequence_length - len(bid)) + bid for bid in batch["block_id"]]
+                batch["block_id"] = [bid + [-1] * (sequence_length - len(bid)) for bid in batch["block_id"]]
 
         if 'segment_ids' in batch:
             assert 'position_ids' in batch

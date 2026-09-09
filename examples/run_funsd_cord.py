@@ -371,16 +371,16 @@ def main():
             padding=False,
             truncation=True,
             return_overflowing_tokens=True,
-            # We use this argument because the texts in our dataset are lists of words (with a label for each word).
             is_split_into_words=True,
         )
 
         labels = []
         bboxes = []
         images = []
-        seg_ids = []  # NEW: per-token local segment index, for LayoutLMv3ForSegmentTokenClassification
+        seg_ids = []
         line_ids = []
         block_ids = []
+
         for batch_index in range(len(tokenized_inputs["input_ids"])):
             word_ids = tokenized_inputs.word_ids(batch_index=batch_index)
             org_batch_index = tokenized_inputs["overflow_to_sample_mapping"][batch_index]
@@ -388,18 +388,9 @@ def main():
             label = examples[label_column_name][org_batch_index]
             bbox = examples["bboxes"][org_batch_index]
 
-            # NEW: recover the original FUNSD/CORD "item" (= segment) boundaries.
-            # funsd.py/cord.py assign an IDENTICAL line-level bbox to every word
-            # belonging to the same item, so grouping consecutive words with the
-            # same bbox tuple exactly reconstructs the gold segment groups --
-            # same trick used in the error-analysis script, no extra annotation
-            # needed.
-            # Only computed when --use_segment_head is set, so the baseline
-            # (vanilla LayoutLMv3ForTokenClassification, which has no `seg_id`
-            # argument in its forward()) never receives this extra batch key.
-            word_seg_id = None
+            # Xây dựng segment ID chuẩn theo word gốc trước, sau đó map sang subword tokens qua word_ids
+            word_seg_ids = []
             if getattr(data_args, "use_segment_head", False):
-                word_seg_id = []
                 seg_counter = -1
                 prev_bbox_tuple = None
                 for wb in bbox:
@@ -407,7 +398,7 @@ def main():
                     if wb_tuple != prev_bbox_tuple:
                         seg_counter += 1
                         prev_bbox_tuple = wb_tuple
-                    word_seg_id.append(seg_counter)
+                    word_seg_ids.append(seg_counter)
 
             word_line_id, word_block_id = None, None
             if getattr(data_args, "use_hpe", False):
@@ -422,44 +413,40 @@ def main():
             previous_word_idx = None
             label_ids = []
             bbox_inputs = []
-            seg_id_inputs = []  # NEW
-            line_id_inputs, block_id_inputs = [], []
+            seg_id_inputs = []
+            line_id_inputs = []
+            block_id_inputs = []
+
             for word_idx in word_ids:
-                # Special tokens have a word id that is None. We set the label to -100 so they are automatically
-                # ignored in the loss function.
                 if word_idx is None:
                     label_ids.append(-100)
                     bbox_inputs.append([0, 0, 0, 0])
-                    if word_seg_id is not None:
-                        seg_id_inputs.append(-1)  # NEW: not part of any segment
-                    if word_line_id is not None:                     # ==== THÊM MỚI ====
-                        line_id_inputs.append(-1)
-                        block_id_inputs.append(-1)
-                # We set the label for the first token of each word.
-                elif word_idx != previous_word_idx:
-                    label_ids.append(label_to_id[label[word_idx]])
-                    bbox_inputs.append(bbox[word_idx])
-                    if word_seg_id is not None:
-                        seg_id_inputs.append(word_seg_id[word_idx])  # NEW
-                    if word_line_id is not None:                     # ==== THÊM MỚI ====
-                        line_id_inputs.append(word_line_id[word_idx])
-                        block_id_inputs.append(word_block_id[word_idx])
-                # For the other tokens in a word, we set the label to either the current label or -100, depending on
-                # the label_all_tokens flag.
+                    seg_id_inputs.append(-1)
+                    line_id_inputs.append(-1)
+                    block_id_inputs.append(-1)
                 else:
-                    label_ids.append(label_to_id[label[word_idx]] if data_args.label_all_tokens else -100)
+                    # Map chính xác segment ID, line ID, block ID từ word sang subword tokens
+                    s_id = word_seg_ids[word_idx] if word_seg_ids else -1
+                    l_id = word_line_id[word_idx] if word_line_id else -1
+                    b_id = word_block_id[word_idx] if word_block_id else -1
+
+                    seg_id_inputs.append(s_id)
+                    line_id_inputs.append(l_id)
+                    block_id_inputs.append(b_id)
                     bbox_inputs.append(bbox[word_idx])
-                    if word_seg_id is not None:
-                        seg_id_inputs.append(word_seg_id[word_idx])  # NEW
-                    if word_line_id is not None:                     # ==== THÊM MỚI ====
-                        line_id_inputs.append(word_line_id[word_idx])
-                        block_id_inputs.append(word_block_id[word_idx])
+
+                    if word_idx != previous_word_idx:
+                        label_ids.append(label_to_id[label[word_idx]])
+                    else:
+                        label_ids.append(label_to_id[label[word_idx]] if data_args.label_all_tokens else -100)
+
                 previous_word_idx = word_idx
+
             labels.append(label_ids)
             bboxes.append(bbox_inputs)
-            if word_seg_id is not None:
-                seg_ids.append(seg_id_inputs)  # NEW
-            if word_line_id is not None:                             # ==== THÊM MỚI ====
+            if getattr(data_args, "use_segment_head", False):
+                seg_ids.append(seg_id_inputs)
+            if getattr(data_args, "use_hpe", False):
                 line_ids.append(line_id_inputs)
                 block_ids.append(block_id_inputs)
 
@@ -473,8 +460,8 @@ def main():
         tokenized_inputs["labels"] = labels
         tokenized_inputs["bbox"] = bboxes
         if getattr(data_args, "use_segment_head", False):
-            tokenized_inputs["seg_id"] = seg_ids  # NEW
-        if getattr(data_args, "use_hpe", False):                     # ==== THÊM MỚI ====
+            tokenized_inputs["seg_id"] = seg_ids
+        if getattr(data_args, "use_hpe", False):
             tokenized_inputs["line_id"] = line_ids
             tokenized_inputs["block_id"] = block_ids
         if data_args.visual_embed:
