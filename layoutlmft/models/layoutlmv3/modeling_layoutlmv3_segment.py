@@ -210,7 +210,7 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
             if self.segment_aux_classifier is not None and labels is not None:
                 seg_targets = torch.full((n_seg,), -100, dtype=torch.long, device=device)
                 for i, mask in enumerate(seg_masks):
-                    seg_label_ids = labels[b, mask]
+                    seg_label_ids = labels[b, :L][mask]
                     valid_lbl = seg_label_ids[seg_label_ids != -100]
                     if valid_lbl.numel() > 0:
                         type_ids = self.label_id2type_id.to(device)[valid_lbl]
