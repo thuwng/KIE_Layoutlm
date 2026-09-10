@@ -139,6 +139,7 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
             self.segment_aux_classifier = nn.Linear(config.hidden_size, self.num_entity_types)
             nn.init.normal_(self.segment_aux_classifier.weight, mean=0.0, std=0.02)
             nn.init.zeros_(self.segment_aux_classifier.bias)
+            self.segment_aux_dropout = nn.Dropout(config.hidden_dropout_prob)
             self.segment_aux_loss_weight = getattr(config, "segment_aux_loss_weight", 0.3)
         else:
             # Không có id2label hợp lệ, hoặc segment_context đã tắt (seg_ctx_layers=0)
@@ -217,7 +218,7 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
                         seg_targets[i] = torch.mode(type_ids).values
                 valid_seg = seg_targets != -100
                 if valid_seg.any():
-                    aux_logits = self.segment_aux_classifier(seg_vecs_ctx[valid_seg])
+                    aux_logits = self.segment_aux_classifier(self.segment_aux_dropout(seg_vecs_ctx[valid_seg]))
                     all_aux_logits.append(aux_logits)
                     all_aux_targets.append(seg_targets[valid_seg])
 

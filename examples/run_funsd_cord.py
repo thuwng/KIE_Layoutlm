@@ -22,6 +22,7 @@ from transformers import (
     Trainer,
     TrainingArguments,
     set_seed,
+    EarlyStoppingCallback,
 )
 from transformers.trainer_utils import get_last_checkpoint, is_main_process
 from transformers.utils import check_min_version
@@ -171,7 +172,12 @@ class DataTrainingArguments:
     second_interpolation: str = field(
         default='lanczos', metadata={"help": "Interpolation for discrete vae (random, bilinear, bicubic)"})
     imagenet_default_mean_and_std: bool = field(default=False, metadata={"help": ""})
-
+    segment_context_layers: int = field(default=1, metadata={"help": "Số layer cho segment transformer"})
+    segment_context_heads: int = field(default=4)
+    segment_context_dropout: float = field(default=0.1)
+    theta_line: float = field(default=5.0)
+    theta_block_x: float = field(default=50.0)
+    theta_block_y: float = field(default=20.0)
 
 def main():
     # See all possible arguments in layoutlmft/transformers/training_args.py
@@ -289,6 +295,12 @@ def main():
         id2label={i: l for i, l in enumerate(label_list)},
         label2id={l: i for i, l in enumerate(label_list)},
         segment_aux_loss_weight=getattr(data_args, "segment_aux_loss_weight", 0.3),
+        segment_context_layers=data_args.segment_context_layers,
+        segment_context_heads=data_args.segment_context_heads,
+        segment_context_dropout=data_args.segment_context_dropout,
+        theta_line=data_args.theta_line,
+        theta_block_x=data_args.theta_block_x,
+        theta_block_y=data_args.theta_block_y,
     )
     tokenizer = AutoTokenizer.from_pretrained(
         model_args.tokenizer_name if model_args.tokenizer_name else model_args.model_name_or_path,
@@ -385,6 +397,8 @@ def main():
             examples[text_column_name],
             padding=False,
             truncation=True,
+            max_length=512,  
+            stride=128,      
             return_overflowing_tokens=True,
             is_split_into_words=True,
         )
@@ -618,8 +632,8 @@ def main():
                     {"params": backbone_decay, "lr": self.args.learning_rate, "weight_decay": self.args.weight_decay},
                     {"params": backbone_nodecay, "lr": self.args.learning_rate, "weight_decay": 0.0},
                     # Module mới (Segment, Gate, Classifier): Đồng bộ LR với backbone hoặc bạn có thể nhân 2 nếu muốn warm-up nhẹ
-                    {"params": new_decay, "lr": 5e-4, "weight_decay": self.args.weight_decay},
-                    {"params": new_nodecay, "lr": 5e-4, "weight_decay": 0.0}
+                    {"params": new_decay, "lr": 1e-4, "weight_decay": self.args.weight_decay},
+                    {"params": new_nodecay, "lr": 1e-4, "weight_decay": 0.0}
                 ]
                 
                 self.optimizer = torch.optim.AdamW(
@@ -632,43 +646,40 @@ def main():
         def log(self, logs: dict) -> None:
             model = self.model.module if hasattr(self.model, "module") else self.model
             
-            # 1. Trích xuất custom metrics
+            # Sửa lỗi Diagnostic: Dùng abs().mean() thay vì mean() để các chiều không bị triệt tiêu
             if hasattr(model, "token_gate") and model.token_gate is not None:
-                logs["token_gate_mean"] = model.token_gate.data.mean().item()
+                logs["token_gate_absmean"] = model.token_gate.data.abs().mean().item()
             if hasattr(model, "segment_context_gate") and model.segment_context_gate is not None:
-                logs["segment_context_gate_mean"] = model.segment_context_gate.data.mean().item()
+                logs["segment_context_gate_absmean"] = model.segment_context_gate.data.abs().mean().item()
             if getattr(model, "_last_aux_seg_loss", None) is not None:
                 logs["segment_aux_loss"] = model._last_aux_seg_loss.item()
             
-            # 2. Gọi hàm log gốc để vẫn báo cáo cho Hugging Face / W&B
             super().log(logs)
 
-            # 3. LƯU KẾT QUẢ RIÊNG RA FILE CSV (Chỉ chạy trên process chính)
-            if self.is_world_process_zero():
-                # Tạo file custom_gate_metrics.csv trong thư mục output
+            # Sửa bug "phantom log": Chỉ ghi CSV khi event có chứa loss
+            if self.is_world_process_zero() and ("loss" in logs or "eval_loss" in logs):
                 output_file = os.path.join(self.args.output_dir, "custom_gate_metrics.csv")
                 file_exists = os.path.isfile(output_file)
-                
-                # Mở file chế độ append ('a') để ghi thêm liên tục
                 with open(output_file, mode='a', newline='') as f:
                     writer = csv.writer(f)
-                    
-                    # Khởi tạo Header nếu file chưa tồn tại
                     if not file_exists:
-                        writer.writerow(["step", "epoch", "train_loss", "eval_loss", "token_gate_mean", "segment_context_gate_mean", "segment_aux_loss"])
+                        writer.writerow(["step", "epoch", "train_loss", "eval_loss", "token_gate_absmean", "segment_context_gate_absmean", "segment_aux_loss"])
                     
-                    # Lọc giá trị để ghi (nếu step đó không có eval_loss thì để trống)
                     writer.writerow([
                         self.state.global_step,
                         round(self.state.epoch or 0, 2),
-                        logs.get("loss", ""),          # Train loss
-                        logs.get("eval_loss", ""),     # Eval loss
-                        round(logs.get("token_gate_mean", 0), 6) if "token_gate_mean" in logs else "",
-                        round(logs.get("segment_context_gate_mean", 0), 6) if "segment_context_gate_mean" in logs else "",
+                        logs.get("loss", ""),
+                        logs.get("eval_loss", ""),
+                        round(logs.get("token_gate_absmean", 0), 6) if "token_gate_absmean" in logs else "",
+                        round(logs.get("segment_context_gate_absmean", 0), 6) if "segment_context_gate_absmean" in logs else "",
                         round(logs.get("segment_aux_loss", 0), 6) if "segment_aux_loss" in logs else ""
                     ])
                     
     # Khởi tạo Trainer bằng CustomTrainer vừa tạo thay vì Trainer mặc định
+    callbacks = []
+    if training_args.load_best_model_at_end:
+        callbacks.append(EarlyStoppingCallback(early_stopping_patience=3))
+    
     trainer = CustomTrainer(
         model=model,
         args=training_args,
@@ -677,6 +688,7 @@ def main():
         tokenizer=tokenizer,
         data_collator=data_collator,
         compute_metrics=compute_metrics,
+        callbacks=callbacks,
     )
     # Initialize our Trainer
     # trainer = Trainer(
@@ -717,42 +729,39 @@ def main():
         trainer.log_metrics("eval", metrics)
         trainer.save_metrics("eval", metrics)
 
-        # ==== THÊM MỚI: TRÍCH XUẤT VÀ LƯU FILE PHÂN TÍCH LỖI ====
+        # ==== THÊM MỚI: TRÍCH XUẤT VÀ LƯU FILE PHÂN TÍCH LỖI (Đã gộp chunk) ====
         logger.info("*** Error Analysis on Eval Set ***")
-        # Gọi predict trên tập eval để lấy logits
         eval_preds = trainer.predict(eval_dataset)
-        pred_logits = eval_preds.predictions
-        pred_labels = np.argmax(pred_logits, axis=2)
+        pred_labels = np.argmax(eval_preds.predictions, axis=2)
         true_labels = eval_preds.label_ids
         input_ids = eval_dataset["input_ids"]
+        
+        # Lấy map để biết chunk này thuộc văn bản gốc nào
+        sample_mapping = eval_dataset["overflow_to_sample_mapping"]
 
         error_file = os.path.join(training_args.output_dir, "eval_error_analysis.txt")
         if trainer.is_world_process_zero():
+            from collections import defaultdict
+            # Gom lỗi theo document gốc
+            doc_errors_map = defaultdict(list)
+            
+            for i in range(len(pred_labels)):
+                org_doc_id = sample_mapping[i]
+                for p, l, tok_id in zip(pred_labels[i], true_labels[i], input_ids[i]):
+                    if l != -100: 
+                        t_lbl = label_list[l]
+                        p_lbl = label_list[p]
+                        if t_lbl != p_lbl:
+                            token_str = tokenizer.decode([tok_id]).strip()
+                            doc_errors_map[org_doc_id].append(
+                                f"Token: {token_str:<20} | Nhãn Thật: {t_lbl:<15} | Dự Đoán: {p_lbl:<15}"
+                            )
+
             with open(error_file, "w", encoding="utf-8") as f:
-                f.write("--- THỐNG KÊ CÁC TOKEN DỰ ĐOÁN SAI TRÊN TẬP EVAL ---\n\n")
-                
-                # Duyệt qua từng văn bản (document) trong batch
-                for i in range(len(pred_labels)):
-                    doc_has_error = False
-                    doc_errors = []
-                    
-                    # Duyệt qua từng token trong văn bản
-                    for p, l, tok_id in zip(pred_labels[i], true_labels[i], input_ids[i]):
-                        if l != -100:  # Bỏ qua các token padding hoặc token bị ẩn (-100)
-                            t_lbl = label_list[l]
-                            p_lbl = label_list[p]
-                            
-                            # Nếu dự đoán sai
-                            if t_lbl != p_lbl:
-                                doc_has_error = True
-                                # Giải mã (decode) token ID ngược lại thành chữ
-                                token_str = tokenizer.decode([tok_id]).strip()
-                                doc_errors.append(f"Token: {token_str:<20} | Nhãn Thật: {t_lbl:<15} | Dự Đoán: {p_lbl:<15}")
-                    
-                    # Chỉ ghi vào file những document có lỗi để dễ theo dõi
-                    if doc_has_error:
-                        f.write(f"=== Document {i} ===\n")
-                        f.write("\n".join(doc_errors) + "\n\n")
+                f.write("--- THỐNG KÊ CÁC TOKEN DỰ ĐOÁN SAI TRÊN TẬP EVAL (Nhóm theo Văn Bản Gốc) ---\n\n")
+                for doc_id, errors in doc_errors_map.items():
+                    f.write(f"=== Document {doc_id} ===\n")
+                    f.write("\n".join(errors) + "\n\n")
                         
         logger.info(f"Đã lưu chi tiết lỗi tại: {error_file}")
         # ========================================================
