@@ -198,10 +198,10 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
                 # Điều này giúp mạng Segment Context hiểu chính xác tương quan gần/xa, trên/dưới.
                 spatial_emb = self.layoutlmv3.embeddings._calc_spatial_position_embeddings(seg_bboxes.unsqueeze(0)).squeeze(0)
 
-                # Cộng cả vector thứ tự đọc và tọa độ không gian vào đại diện của segment
-                seg_vecs_with_pos = seg_vecs + order_emb + spatial_emb
-                ctx_out = self.segment_context(seg_vecs_with_pos.unsqueeze(0)).squeeze(0)
-                seg_vecs_ctx = seg_vecs + self.segment_context_gate * (ctx_out - seg_vecs)
+                # SỬA: Hãm segment_context_gate bằng tanh với biên độ 0.1
+                max_gate_scale = 0.1
+                ctx_gate = torch.tanh(self.segment_context_gate) * max_gate_scale
+                seg_vecs_ctx = seg_vecs + ctx_gate * (ctx_out - seg_vecs)
             else:
                 seg_vecs_ctx = seg_vecs
 
@@ -222,15 +222,19 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
                     all_aux_logits.append(aux_logits)
                     all_aux_targets.append(seg_targets[valid_seg])
 
+            # SỬA: Hãm token_gate tương tự
+            max_gate_scale = 0.1
+            t_gate = torch.tanh(self.token_gate) * max_gate_scale
             for i, mask in enumerate(seg_masks):
                 # THAY ĐỔI LỚN (Priority 2): Sử dụng Residual Injection thay vì Overwrite
-                broadcast_hidden[b, mask] = text_hidden[b, mask] + self.token_gate * (seg_vecs_ctx[i] - text_hidden[b, mask])
+                broadcast_hidden[b, mask] = text_hidden[b, mask] + t_gate * (seg_vecs_ctx[i] - text_hidden[b, mask])
 
         aux_loss = None
         if self.segment_aux_classifier is not None and len(all_aux_logits) > 0:
             aux_logits_cat = torch.cat(all_aux_logits, dim=0)
             aux_targets_cat = torch.cat(all_aux_targets, dim=0)
-            aux_loss = CrossEntropyLoss()(aux_logits_cat, aux_targets_cat)
+            # SỬA: Thêm label_smoothing=0.1
+            aux_loss = CrossEntropyLoss(label_smoothing=0.1)(aux_logits_cat, aux_targets_cat)
 
         return broadcast_hidden, aux_loss
     

@@ -646,28 +646,36 @@ def main():
         def log(self, logs: dict) -> None:
             model = self.model.module if hasattr(self.model, "module") else self.model
             
-            # Sửa lỗi Diagnostic: Dùng abs().mean() thay vì mean() để các chiều không bị triệt tiêu
-            if hasattr(model, "token_gate") and model.token_gate is not None:
-                logs["token_gate_absmean"] = model.token_gate.data.abs().mean().item()
-            if hasattr(model, "segment_context_gate") and model.segment_context_gate is not None:
-                logs["segment_context_gate_absmean"] = model.segment_context_gate.data.abs().mean().item()
-            if getattr(model, "_last_aux_seg_loss", None) is not None:
-                logs["segment_aux_loss"] = model._last_aux_seg_loss.item()
+            # SỬA: Tách bạch rõ ràng log của train và log của eval
+            is_eval_call = any(k.startswith("eval_") for k in logs)
+            is_train_call = "loss" in logs and not is_eval_call
+            
+            # Chỉ móc thêm metric khi đây là 1 log có ý nghĩa (tránh các log rác/setup)
+            if is_train_call or is_eval_call:
+                if hasattr(model, "token_gate") and model.token_gate is not None:
+                    logs["token_gate_absmean"] = model.token_gate.data.abs().mean().item()
+                if hasattr(model, "segment_context_gate") and model.segment_context_gate is not None:
+                    logs["segment_context_gate_absmean"] = model.segment_context_gate.data.abs().mean().item()
+                if getattr(model, "_last_aux_seg_loss", None) is not None:
+                    logs["segment_aux_loss"] = model._last_aux_seg_loss.item()
             
             super().log(logs)
 
-            # Sửa bug "phantom log": Chỉ ghi CSV khi event có chứa loss
-            if self.is_world_process_zero() and ("loss" in logs or "eval_loss" in logs):
+            # SỬA: Ghi CSV kèm theo cột Phase (train/eval)
+            if self.is_world_process_zero() and (is_train_call or is_eval_call):
                 output_file = os.path.join(self.args.output_dir, "custom_gate_metrics.csv")
                 file_exists = os.path.isfile(output_file)
                 with open(output_file, mode='a', newline='') as f:
                     writer = csv.writer(f)
                     if not file_exists:
-                        writer.writerow(["step", "epoch", "train_loss", "eval_loss", "token_gate_absmean", "segment_context_gate_absmean", "segment_aux_loss"])
+                        # Thêm cột "phase"
+                        writer.writerow(["step", "epoch", "phase", "train_loss", "eval_loss", "token_gate_absmean", "segment_context_gate_absmean", "segment_aux_loss"])
                     
+                    phase = "eval" if is_eval_call else "train"
                     writer.writerow([
                         self.state.global_step,
                         round(self.state.epoch or 0, 2),
+                        phase,
                         logs.get("loss", ""),
                         logs.get("eval_loss", ""),
                         round(logs.get("token_gate_absmean", 0), 6) if "token_gate_absmean" in logs else "",
@@ -741,9 +749,9 @@ def main():
 
         error_file = os.path.join(training_args.output_dir, "eval_error_analysis.txt")
         if trainer.is_world_process_zero():
-            from collections import defaultdict
-            # Gom lỗi theo document gốc
+            from collections import defaultdict, Counter
             doc_errors_map = defaultdict(list)
+            confusion = Counter() # THÊM: Bộ đếm lỗi tự động
             
             for i in range(len(pred_labels)):
                 org_doc_id = sample_mapping[i]
@@ -752,12 +760,22 @@ def main():
                         t_lbl = label_list[l]
                         p_lbl = label_list[p]
                         if t_lbl != p_lbl:
+                            confusion[(t_lbl, p_lbl)] += 1 # Đếm cặp lỗi
                             token_str = tokenizer.decode([tok_id]).strip()
                             doc_errors_map[org_doc_id].append(
                                 f"Token: {token_str:<20} | Nhãn Thật: {t_lbl:<15} | Dự Đoán: {p_lbl:<15}"
                             )
 
             with open(error_file, "w", encoding="utf-8") as f:
+                # Ghi Confusion Matrix ra đầu file
+                f.write("--- BẢNG THỐNG KÊ LỖI (CONFUSION MATRIX) ---\n")
+                f.write(f"{'Nhãn Thật':<15} -> {'Dự Đoán':<15} : Số lượng\n")
+                f.write("-" * 50 + "\n")
+                for (t, p), count in confusion.most_common():
+                    f.write(f"{t:<15} -> {p:<15} : {count}\n")
+                f.write("\n")
+
+                # Ghi chi tiết log
                 f.write("--- THỐNG KÊ CÁC TOKEN DỰ ĐOÁN SAI TRÊN TẬP EVAL (Nhóm theo Văn Bản Gốc) ---\n\n")
                 for doc_id, errors in doc_errors_map.items():
                     f.write(f"=== Document {doc_id} ===\n")
