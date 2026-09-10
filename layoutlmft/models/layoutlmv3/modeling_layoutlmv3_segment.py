@@ -198,6 +198,11 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
                 # Điều này giúp mạng Segment Context hiểu chính xác tương quan gần/xa, trên/dưới.
                 spatial_emb = self.layoutlmv3.embeddings._calc_spatial_position_embeddings(seg_bboxes.unsqueeze(0)).squeeze(0)
 
+                # === BỔ SUNG LẠI 2 DÒNG BỊ XÓA NHẦM ===
+                seg_vecs_with_pos = seg_vecs + order_emb + spatial_emb
+                ctx_out = self.segment_context(seg_vecs_with_pos.unsqueeze(0)).squeeze(0)
+                # =====================================
+
                 # SỬA: Hãm segment_context_gate bằng tanh với biên độ 0.1
                 max_gate_scale = 0.1
                 ctx_gate = torch.tanh(self.segment_context_gate) * max_gate_scale
