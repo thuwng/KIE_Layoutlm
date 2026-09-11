@@ -77,6 +77,3 @@ class LayoutLMv3Config(BertConfig):
         self.theta_block_x = theta_block_x
         self.theta_block_y = theta_block_y
         self.max_segment_position = max_segment_position
-        self.segment_context_layers = kwargs.pop("segment_context_layers", 1)
-        self.segment_context_heads = kwargs.pop("segment_context_heads", 4)
-        self.segment_context_dropout = kwargs.pop("segment_context_dropout", 0.1)

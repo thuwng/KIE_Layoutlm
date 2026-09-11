@@ -1,7 +1,6 @@
 #!/usr/bin/env python
 # coding=utf-8
 import logging
-import csv
 import os
 import sys
 from dataclasses import dataclass, field
@@ -22,7 +21,6 @@ from transformers import (
     Trainer,
     TrainingArguments,
     set_seed,
-    EarlyStoppingCallback,
 )
 from transformers.trainer_utils import get_last_checkpoint, is_main_process
 from transformers.utils import check_min_version
@@ -157,13 +155,6 @@ class DataTrainingArguments:
             "and feed them into LayoutLMv3ForSegmentTokenClassification. Requires --use_segment_head."
         },
     )
-    segment_aux_loss_weight: float = field(
-        default=0.3,
-        metadata={
-            "help": "Weight of the auxiliary segment-level entity-type loss (Bước 2) added to "
-            "the main token classification loss. 0 disables it entirely."
-        },
-    )
     data_dir: Optional[str] = field(default=None)
     input_size: int = field(default=224, metadata={"help": "images input size for backbone"})
     second_input_size: int = field(default=112, metadata={"help": "images input size for discrete vae"})
@@ -172,12 +163,7 @@ class DataTrainingArguments:
     second_interpolation: str = field(
         default='lanczos', metadata={"help": "Interpolation for discrete vae (random, bilinear, bicubic)"})
     imagenet_default_mean_and_std: bool = field(default=False, metadata={"help": ""})
-    segment_context_layers: int = field(default=1, metadata={"help": "Số layer cho segment transformer"})
-    segment_context_heads: int = field(default=4)
-    segment_context_dropout: float = field(default=0.1)
-    theta_line: float = field(default=5.0)
-    theta_block_x: float = field(default=50.0)
-    theta_block_y: float = field(default=20.0)
+
 
 def main():
     # See all possible arguments in layoutlmft/transformers/training_args.py
@@ -288,19 +274,6 @@ def main():
         input_size=data_args.input_size,
         use_auth_token=True if model_args.use_auth_token else None,
         use_hpe=getattr(data_args, "use_hpe", False),
-        # NEW: bắt buộc cho aux segment loss (Bước 2) — nếu không truyền,
-        # HF tự sinh id2label giả dạng "LABEL_0","LABEL_1",... khiến hàm
-        # gộp "B-QUESTION"/"I-QUESTION" -> "QUESTION" trong
-        # modeling_layoutlmv3_segment.py mất tác dụng.
-        id2label={i: l for i, l in enumerate(label_list)},
-        label2id={l: i for i, l in enumerate(label_list)},
-        segment_aux_loss_weight=getattr(data_args, "segment_aux_loss_weight", 0.3),
-        segment_context_layers=data_args.segment_context_layers,
-        segment_context_heads=data_args.segment_context_heads,
-        segment_context_dropout=data_args.segment_context_dropout,
-        theta_line=data_args.theta_line,
-        theta_block_x=data_args.theta_block_x,
-        theta_block_y=data_args.theta_block_y,
     )
     tokenizer = AutoTokenizer.from_pretrained(
         model_args.tokenizer_name if model_args.tokenizer_name else model_args.model_name_or_path,
@@ -397,8 +370,6 @@ def main():
             examples[text_column_name],
             padding=False,
             truncation=True,
-            max_length=512,  
-            stride=128,      
             return_overflowing_tokens=True,
             is_split_into_words=True,
         )
@@ -409,7 +380,6 @@ def main():
         seg_ids = []
         line_ids = []
         block_ids = []
-        is_first_batch = []
 
         for batch_index in range(len(tokenized_inputs["input_ids"])):
             word_ids = tokenized_inputs.word_ids(batch_index=batch_index)
@@ -440,24 +410,12 @@ def main():
                     theta_block_y=getattr(data_args, "theta_block_y", 20),
                 )
 
-            word_is_first = []
-            prev_bbox_tuple_for_first = None
-            for wb in bbox:
-                wb_tup = tuple(wb)
-                if wb_tup != prev_bbox_tuple_for_first:
-                    word_is_first.append(1)
-                    prev_bbox_tuple_for_first = wb_tup
-                else:
-                    word_is_first.append(0)
-
             previous_word_idx = None
             label_ids = []
             bbox_inputs = []
             seg_id_inputs = []
             line_id_inputs = []
             block_id_inputs = []
-            is_first_inputs = [] 
-            seen_words = set()
 
             for word_idx in word_ids:
                 if word_idx is None:
@@ -466,15 +424,7 @@ def main():
                     seg_id_inputs.append(-1)
                     line_id_inputs.append(-1)
                     block_id_inputs.append(-1)
-                    is_first_inputs.append(0)
                 else:
-                    # Map chuẩn xác vào chunk: chỉ subword đầu tiên của từ ĐẦU TIÊN trong segment mới là is_first=1
-                    if word_idx not in seen_words:
-                        seen_words.add(word_idx)
-                        is_first_inputs.append(word_is_first[word_idx])
-                    else:
-                        is_first_inputs.append(0)
-
                     # Map chính xác segment ID, line ID, block ID từ word sang subword tokens
                     s_id = word_seg_ids[word_idx] if word_seg_ids else -1
                     l_id = word_line_id[word_idx] if word_line_id else -1
@@ -496,7 +446,6 @@ def main():
             bboxes.append(bbox_inputs)
             if getattr(data_args, "use_segment_head", False):
                 seg_ids.append(seg_id_inputs)
-                is_first_batch.append(is_first_inputs)
             if getattr(data_args, "use_hpe", False):
                 line_ids.append(line_id_inputs)
                 block_ids.append(block_id_inputs)
@@ -512,7 +461,6 @@ def main():
         tokenized_inputs["bbox"] = bboxes
         if getattr(data_args, "use_segment_head", False):
             tokenized_inputs["seg_id"] = seg_ids
-            tokenized_inputs["is_first"] = is_first_batch
         if getattr(data_args, "use_hpe", False):
             tokenized_inputs["line_id"] = line_ids
             tokenized_inputs["block_id"] = block_ids
@@ -612,7 +560,8 @@ def main():
     class CustomTrainer(Trainer):
         def create_optimizer(self):
             if self.optimizer is None:
-                no_decay = ["bias", "LayerNorm.weight", "layer_norm.weight", "gate", "is_first_token_embedding", "segment_position_embedding"]
+                # Định nghĩa thủ công các tham số không dùng weight decay
+                no_decay = ["bias", "LayerNorm.weight", "layer_norm.weight"]
                 
                 # Phân tách 4 nhóm tham số bằng cách check chuỗi trực tiếp
                 backbone_decay = [p for n, p in self.model.named_parameters() if "layoutlmv3" in n and not any(nd in n for nd in no_decay) and p.requires_grad]
@@ -628,12 +577,12 @@ def main():
                 # ============================================================
 
                 optimizer_grouped_parameters = [
-                    # Backbone (LayoutLMv3 gốc)
+                    # Backbone (LayoutLMv3 gốc): LR thấp
                     {"params": backbone_decay, "lr": self.args.learning_rate, "weight_decay": self.args.weight_decay},
                     {"params": backbone_nodecay, "lr": self.args.learning_rate, "weight_decay": 0.0},
-                    # Module mới (Segment, Gate, Classifier): Đồng bộ LR với backbone hoặc bạn có thể nhân 2 nếu muốn warm-up nhẹ
-                    {"params": new_decay, "lr": 1e-4, "weight_decay": self.args.weight_decay},
-                    {"params": new_nodecay, "lr": 1e-4, "weight_decay": 0.0}
+                    # Module mới (Segment, Gate, Classifier): LR cao
+                    {"params": new_decay, "lr": 5e-4, "weight_decay": self.args.weight_decay},
+                    {"params": new_nodecay, "lr": 5e-4, "weight_decay": 0.0}
                 ]
                 
                 self.optimizer = torch.optim.AdamW(
@@ -643,51 +592,7 @@ def main():
                 )
             return self.optimizer
 
-        def log(self, logs: dict) -> None:
-            model = self.model.module if hasattr(self.model, "module") else self.model
-            
-            # SỬA: Tách bạch rõ ràng log của train và log của eval
-            is_eval_call = any(k.startswith("eval_") for k in logs)
-            is_train_call = "loss" in logs and not is_eval_call
-            
-            # Chỉ móc thêm metric khi đây là 1 log có ý nghĩa (tránh các log rác/setup)
-            if is_train_call or is_eval_call:
-                if hasattr(model, "token_gate") and model.token_gate is not None:
-                    logs["token_gate_absmean"] = model.token_gate.data.abs().mean().item()
-                if hasattr(model, "segment_context_gate") and model.segment_context_gate is not None:
-                    logs["segment_context_gate_absmean"] = model.segment_context_gate.data.abs().mean().item()
-                if getattr(model, "_last_aux_seg_loss", None) is not None:
-                    logs["segment_aux_loss"] = model._last_aux_seg_loss.item()
-            
-            super().log(logs)
-
-            # SỬA: Ghi CSV kèm theo cột Phase (train/eval)
-            if self.is_world_process_zero() and (is_train_call or is_eval_call):
-                output_file = os.path.join(self.args.output_dir, "custom_gate_metrics.csv")
-                file_exists = os.path.isfile(output_file)
-                with open(output_file, mode='a', newline='') as f:
-                    writer = csv.writer(f)
-                    if not file_exists:
-                        # Thêm cột "phase"
-                        writer.writerow(["step", "epoch", "phase", "train_loss", "eval_loss", "token_gate_absmean", "segment_context_gate_absmean", "segment_aux_loss"])
-                    
-                    phase = "eval" if is_eval_call else "train"
-                    writer.writerow([
-                        self.state.global_step,
-                        round(self.state.epoch or 0, 2),
-                        phase,
-                        logs.get("loss", ""),
-                        logs.get("eval_loss", ""),
-                        round(logs.get("token_gate_absmean", 0), 6) if "token_gate_absmean" in logs else "",
-                        round(logs.get("segment_context_gate_absmean", 0), 6) if "segment_context_gate_absmean" in logs else "",
-                        round(logs.get("segment_aux_loss", 0), 6) if "segment_aux_loss" in logs else ""
-                    ])
-                    
     # Khởi tạo Trainer bằng CustomTrainer vừa tạo thay vì Trainer mặc định
-    callbacks = []
-    if training_args.load_best_model_at_end:
-        callbacks.append(EarlyStoppingCallback(early_stopping_patience=3))
-    
     trainer = CustomTrainer(
         model=model,
         args=training_args,
@@ -696,7 +601,6 @@ def main():
         tokenizer=tokenizer,
         data_collator=data_collator,
         compute_metrics=compute_metrics,
-        callbacks=callbacks,
     )
     # Initialize our Trainer
     # trainer = Trainer(
@@ -736,53 +640,6 @@ def main():
 
         trainer.log_metrics("eval", metrics)
         trainer.save_metrics("eval", metrics)
-
-        # ==== THÊM MỚI: TRÍCH XUẤT VÀ LƯU FILE PHÂN TÍCH LỖI (Đã gộp chunk) ====
-        logger.info("*** Error Analysis on Eval Set ***")
-        eval_preds = trainer.predict(eval_dataset)
-        pred_labels = np.argmax(eval_preds.predictions, axis=2)
-        true_labels = eval_preds.label_ids
-        input_ids = eval_dataset["input_ids"]
-        
-        # Lấy map để biết chunk này thuộc văn bản gốc nào
-        sample_mapping = eval_dataset["overflow_to_sample_mapping"]
-
-        error_file = os.path.join(training_args.output_dir, "eval_error_analysis.txt")
-        if trainer.is_world_process_zero():
-            from collections import defaultdict, Counter
-            doc_errors_map = defaultdict(list)
-            confusion = Counter() # THÊM: Bộ đếm lỗi tự động
-            
-            for i in range(len(pred_labels)):
-                org_doc_id = sample_mapping[i]
-                for p, l, tok_id in zip(pred_labels[i], true_labels[i], input_ids[i]):
-                    if l != -100: 
-                        t_lbl = label_list[l]
-                        p_lbl = label_list[p]
-                        if t_lbl != p_lbl:
-                            confusion[(t_lbl, p_lbl)] += 1 # Đếm cặp lỗi
-                            token_str = tokenizer.decode([tok_id]).strip()
-                            doc_errors_map[org_doc_id].append(
-                                f"Token: {token_str:<20} | Nhãn Thật: {t_lbl:<15} | Dự Đoán: {p_lbl:<15}"
-                            )
-
-            with open(error_file, "w", encoding="utf-8") as f:
-                # Ghi Confusion Matrix ra đầu file
-                f.write("--- BẢNG THỐNG KÊ LỖI (CONFUSION MATRIX) ---\n")
-                f.write(f"{'Nhãn Thật':<15} -> {'Dự Đoán':<15} : Số lượng\n")
-                f.write("-" * 50 + "\n")
-                for (t, p), count in confusion.most_common():
-                    f.write(f"{t:<15} -> {p:<15} : {count}\n")
-                f.write("\n")
-
-                # Ghi chi tiết log
-                f.write("--- THỐNG KÊ CÁC TOKEN DỰ ĐOÁN SAI TRÊN TẬP EVAL (Nhóm theo Văn Bản Gốc) ---\n\n")
-                for doc_id, errors in doc_errors_map.items():
-                    f.write(f"=== Document {doc_id} ===\n")
-                    f.write("\n".join(errors) + "\n\n")
-                        
-        logger.info(f"Đã lưu chi tiết lỗi tại: {error_file}")
-        # ========================================================
 
     # Predict
     if training_args.do_predict:
