@@ -5,7 +5,8 @@ import os
 import sys
 from dataclasses import dataclass, field
 from typing import Optional
-
+import pandas as pd
+from collections import defaultdict
 import numpy as np
 from datasets import ClassLabel, load_dataset
 import evaluate
@@ -469,6 +470,53 @@ def main():
 
         return tokenized_inputs
 
+    def analyze_evaluation_errors(true_predictions, true_labels, eval_dataset, tokenizer, output_dir):
+        """
+        Thống kê và liệt kê chi tiết các lỗi dự đoán (False Positives, False Negatives, Mismatch)
+        để lưu lại file log phân tích lỗi.
+        """
+        error_records = []
+        entity_error_stats = defaultdict(lambda: {"tp": 0, "fp": 0, "fn": 0})
+
+        for i, (preds, labels) in enumerate(zip(true_predictions, true_labels)):
+            # Lấy thông tin văn bản gốc nếu có trong dataset để dễ tra cứu lỗi
+            words = eval_dataset[i].get(text_column_name, [])
+            
+            for token_idx, (p_tag, t_tag) in enumerate(zip(preds, labels)):
+                if p_tag != t_tag:
+                    error_records.append({
+                        "sample_index": i,
+                        "token_index": token_idx,
+                        "predicted_tag": p_tag,
+                        "true_tag": t_tag,
+                    })
+                    
+                # Thống kê đơn giản theo nhãn
+                if t_tag != "O" or p_tag != "O":
+                    clean_t = t_tag.split("-")[-1] if t_tag != "O" else "O"
+                    clean_p = p_tag.split("-")[-1] if p_tag != "O" else "O"
+                    
+                    if p_tag == t_tag:
+                        if clean_t != "O":
+                            entity_error_stats[clean_t]["tp"] += 1
+                    else:
+                        if t_tag != "O":
+                            entity_error_stats[clean_t]["fn"] += 1
+                        if p_tag != "O":
+                            entity_error_stats[clean_p]["fp"] += 1
+
+        # Lưu báo cáo lỗi chi tiết ra file CSV hoặc TXT để theo dõi
+        os.makedirs(output_dir, exist_ok=True)
+        error_log_path = os.path.join(output_dir, "detailed_error_analysis.txt")
+        with open(error_log_path, "w", encoding="utf-8") as f:
+            f.write(f"{'SampleID':<10} | {'TokenID':<8} | {'True Tag':<15} | {'Predicted Tag':<15}\n")
+            f.write("-" * 65 + "\n")
+            for err in error_records[:500]: # Ghi nhận tối đa 500 lỗi đầu tiên tránh file quá lớn
+                f.write(f"{err['sample_index']:<10} | {err['token_index']:<8} | {err['true_tag']:<15} | {err['predicted_tag']:<15}\n")
+
+        logger.info(f"📁 Đã xuất báo cáo chi tiết lỗi eval tại: {error_log_path}")
+        return error_records, entity_error_stats
+
     if training_args.do_train:
         if "train" not in datasets:
             raise ValueError("--do_train requires a train dataset")
@@ -592,6 +640,16 @@ def main():
                 )
             return self.optimizer
 
+        def training_step(self, model, inputs):
+            loss = super().training_step(model, inputs)
+            # Theo dõi log LR của từng nhóm param qua trainer state nếu cần thiết
+            if self.state.global_step % self.args.logging_steps == 0:
+                lr_backbone = self.optimizer.param_groups[0]["lr"]
+                lr_new = self.optimizer.param_groups[2]["lr"]
+                if self.is_world_process_zero():
+                    logger.info(f"Step {self.state.global_step} - LR Backbone: {lr_backbone:.6f} | LR New Modules: {lr_new:.6f}")
+            return loss
+
     # Khởi tạo Trainer bằng CustomTrainer vừa tạo thay vì Trainer mặc định
     trainer = CustomTrainer(
         model=model,
@@ -634,6 +692,20 @@ def main():
         logger.info("*** Evaluate ***")
 
         metrics = trainer.evaluate()
+        eval_preds, eval_labels, _ = trainer.predict(eval_dataset) # Lấy dự đoán chi tiết trên tập eval
+        eval_preds_argmax = np.argmax(eval_preds, axis=2)
+
+        true_predictions = [
+            [label_list[p] for (p, l) in zip(prediction, label) if l != -100]
+            for prediction, label in zip(eval_preds_argmax, eval_labels)
+        ]
+        true_labels = [
+            [label_list[l] for (p, l) in zip(prediction, label) if l != -100]
+            for prediction, label in zip(eval_preds_argmax, eval_labels)
+        ]
+
+        # Gọi hàm thống kê lỗi
+        analyze_evaluation_errors(true_predictions, true_labels, eval_dataset, tokenizer, training_args.output_dir)
 
         max_val_samples = data_args.max_val_samples if data_args.max_val_samples is not None else len(eval_dataset)
         metrics["eval_samples"] = min(max_val_samples, len(eval_dataset))
