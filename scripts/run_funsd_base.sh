@@ -16,7 +16,6 @@ SEEDS=(42 123 1993)
 
 for SEED in "${SEEDS[@]}"
 do
-
     OUT="./funsd-base-seed${SEED}"
 
     echo ""
@@ -31,8 +30,8 @@ do
 
     rm -rf "$OUT"
 
-    # GỌI PYTHON TỪ CONDA ENV THAY VÌ PYTHON HỆ THỐNG
-    $PYTHON_CMD -m torch.distributed.launch --nproc_per_node=2 examples/run_funsd_cord.py \
+    # SỬA LỖI 3: Dùng torchrun thay cho torch.distributed.launch
+    $PYTHON_CMD -m torch.distributed.run --nproc_per_node=2 examples/run_funsd_cord.py \
       --dataset_name funsd \
       --do_train \
       --do_eval \
@@ -40,8 +39,6 @@ do
       --use_segment_head \
       --model_name_or_path /kaggle/working/layoutlmv3-base-local \
       --output_dir "$OUT" \
-      --segment_level_layout 1 \
-      --visual_embed 1 \
       --input_size 224 \
       --max_steps 1000 \
       --save_steps 1000 \
@@ -58,6 +55,7 @@ do
       --seed "$SEED" \
       --overwrite_output_dir \
       --overwrite_cache
+      # SỬA LỖI 2: Đã loại bỏ --segment_level_layout 1 và --visual_embed 1 (Mặc định đã là True)
 done
 
 echo ""
