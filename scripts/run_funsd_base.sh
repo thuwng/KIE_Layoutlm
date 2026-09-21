@@ -32,7 +32,7 @@ do
     rm -rf "$OUT"
 
     # GỌI PYTHON TỪ CONDA ENV THAY VÌ PYTHON HỆ THỐNG
-    $PYTHON_CMD examples/run_funsd_cord.py \
+    !/kaggle/working/miniconda/envs/layoutlmv3/bin/python -m torch.distributed.run \
       --nproc_per_node=2 \
       --dataset_name funsd \
       --do_train \
