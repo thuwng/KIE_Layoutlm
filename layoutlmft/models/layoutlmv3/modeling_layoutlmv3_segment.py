@@ -93,6 +93,7 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
         # Cải tiến 3: BIO-aware Gating
         self.bio_embed = nn.Embedding(2, config.hidden_size)
         self.gate_linear = nn.Linear(config.hidden_size * 2, config.hidden_size)
+        torch.nn.init.constant_(self.gate_linear.bias, 3.0)
 
         self.init_weights()
 
@@ -106,30 +107,28 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
         summ.scatter_add_(1, idx.unsqueeze(-1).expand(-1, -1, H), h * valid.unsqueeze(-1).to(h.dtype))
         return summ / cnt.clamp(min=1).unsqueeze(-1)
 
-    def _pool_vision(self, image_hidden, seg_bbox):
-        """ Tính trung bình các Image Patch rơi vào trong vùng Segment Bounding Box """
-        B, max_seg, _ = seg_bbox.shape
-        _, N, H = image_hidden.shape
-        # LayoutLMv3 dùng lưới 14x14 (patch size 16 trên ảnh 224). N=196.
-        if N != 196:
-            return torch.zeros((B, max_seg, H), device=image_hidden.device)
-
-        vision_patches = image_hidden.view(B, 14, 14, H)
+    def _pool_vision(self, image_hidden, seg_bbox, seg_mask):
+        B, S, _ = seg_bbox.shape
+        g = 14  # Giả định lưới 14x14 của LayoutLMv3
+        cell = 1000.0 / g
         
-        # Scale coord (0-1000) về lưới (0-14)
-        scaled_box = seg_bbox.float() / 1000.0 * 14.0
-        x0, y0 = scaled_box[..., 0].long().clamp(0, 13), scaled_box[..., 1].long().clamp(0, 13)
-        x1, y1 = scaled_box[..., 2].long().clamp(0, 13), scaled_box[..., 3].long().clamp(0, 13)
+        # Tạo các điểm ranh giới của lưới
+        edges = torch.arange(g + 1, device=seg_bbox.device).float() * cell
+        lo, hi = edges[:-1], edges[1:]
         
-        out_v = torch.zeros(B, max_seg, H, device=image_hidden.device)
-        for b in range(B):
-            for s in range(max_seg):
-                if x0[b, s] == x1[b, s] and y0[b, s] == y1[b, s]: continue
-                # Trích xuất các patch nằm trong BBox của segment
-                patch_roi = vision_patches[b, y0[b,s]:y1[b,s]+1, x0[b,s]:x1[b,s]+1, :]
-                if patch_roi.numel() > 0:
-                    out_v[b, s] = patch_roi.mean(dim=(0,1))
-        return out_v
+        b = seg_bbox.float()
+        
+        # So sánh tọa độ bbox với lưới
+        ix = (b[..., 0:1] < hi) & (b[..., 2:3] >= lo)  # B, S, g
+        iy = (b[..., 1:2] < hi) & (b[..., 3:4] >= lo)  # B, S, g
+        
+        # Tạo mask giao điểm (intersection mask)
+        m = (iy.unsqueeze(-1) & ix.unsqueeze(-2)).flatten(2).float() * seg_mask.unsqueeze(-1)
+        
+        # Pool đặc trưng và trung bình hóa, clamp để tránh chia cho 0
+        pooled = (m @ image_hidden) / m.sum(-1, keepdim=True).clamp(min=1)
+        
+        return pooled
 
     def forward(
         self,
@@ -165,13 +164,7 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
             
             seg_vec = self.multimodal_fusion(torch.cat([t_pool, v_pool], dim=-1))
             
-            # Cải tiến 4: Graph-level Structural Dropout
-            if self.training:
-                # Ngẫu nhiên "che" 15% các segment để ép mô hình đọc ngữ cảnh xa hơn
-                drop_mask = torch.rand((seg_vec.size(0), max_seg), device=seg_vec.device) > 0.15
-                active_seg_mask = seg_mask & drop_mask
-            else:
-                active_seg_mask = seg_mask
+            active_seg_mask = seg_mask
 
             # Cải tiến 2: 2D Bias Transformer
             seg_ctx = self.segment_encoder(seg_vec, seg_bbox, active_seg_mask)

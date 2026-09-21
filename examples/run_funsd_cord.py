@@ -536,31 +536,6 @@ def main():
 
     # Định nghĩa Trainer tùy chỉnh để tách biệt Learning Rate và dùng eval_collator
     class CustomTrainer(Trainer):
-        def create_optimizer(self):
-            if self.optimizer is None:
-                no_decay = ["bias", "LayerNorm.weight", "layer_norm", "gate"]
-                def is_backbone(n): return "layoutlmv3" in n
-                
-                groups = []
-                for bb in (True, False):
-                    for nd in (True, False):
-                        ps = [p for n, p in self.model.named_parameters()
-                              if p.requires_grad and is_backbone(n) == bb
-                              and any(x in n for x in no_decay) == nd]
-                        if ps:
-                            groups.append({
-                                "params": ps,
-                                "lr": self.args.learning_rate if bb else getattr(data_args, "new_module_lr", 2e-4),
-                                "weight_decay": 0.0 if nd else self.args.weight_decay,
-                            })
-                self.optimizer = torch.optim.AdamW(
-                    groups, 
-                    betas=(self.args.adam_beta1, self.args.adam_beta2),
-                    eps=self.args.adam_epsilon,
-                )
-            return self.optimizer
-
-        # 2. Thêm các hàm để dùng collator riêng cho eval
         def _eval_c(self, fn, ds):
             tr_collator = self.data_collator
             self.data_collator = eval_collator

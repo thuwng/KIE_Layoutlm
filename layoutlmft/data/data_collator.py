@@ -28,7 +28,6 @@ class DataCollatorForKeyValueExtraction(DataCollatorMixin):
     max_length: Optional[int] = None
     pad_to_multiple_of: Optional[int] = None
     label_pad_token_id: int = -100
-    structural_mask_prob: float = 0.1  # THÊM MỚI
     training: bool = True              # THÊM MỚI
 
     def __call__(self, features):
