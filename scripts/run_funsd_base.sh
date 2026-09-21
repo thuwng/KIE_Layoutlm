@@ -2,7 +2,11 @@
 
 set -e
 
+# Đổi đường dẫn làm việc sang đúng thư mục trên Kaggle
 cd /kaggle/working/KIE_Layoutlm
+
+# Khai báo biến trỏ thẳng vào Python của Conda
+PYTHON_CMD="/kaggle/working/miniconda/envs/layoutlmv3/bin/python"
 
 export PYTHONPATH="/kaggle/working/KIE_Layoutlm:$PYTHONPATH"
 export TOKENIZERS_PARALLELISM=false
@@ -20,7 +24,6 @@ do
     echo "FUNSD BASE - SEED = ${SEED}"
     echo "============================================================"
 
-    # Nếu seed đã có kết quả thì bỏ qua
     if [ -f "$OUT/eval_results.json" ]; then
         echo "[SKIP] Seed ${SEED} đã có kết quả."
         continue
@@ -28,14 +31,14 @@ do
 
     rm -rf "$OUT"
 
-    # Giữ nguyên torch.distributed.launch như bản gốc để đảm bảo công bằng 100%
+    # GỌI PYTHON TỪ CONDA ENV THAY VÌ PYTHON HỆ THỐNG
     $PYTHON_CMD examples/run_funsd_cord.py \
       --dataset_name funsd \
       --do_train \
       --do_eval \
       --do_predict \
       --use_segment_head \
-      --model_name_or_path models/layoutlmv3-base \
+      --model_name_or_path /kaggle/working/layoutlmv3-base-local \
       --output_dir "$OUT" \
       --segment_level_layout 1 \
       --visual_embed 1 \
@@ -61,26 +64,18 @@ echo "============================================================"
 echo "CALCULATING FUNSD BASE 3-SEED MEAN ± STD"
 echo "============================================================"
 
-python - <<'PY'
+# CŨNG DÙNG CONDA PYTHON CHO ĐOẠN SCRIPT TÍNH TOÁN NÀY
+$PYTHON_CMD - <<'PY'
 import os
 import json
 import numpy as np
 
 seeds = [42, 123, 1993]
-
-metrics = [
-    "eval_accuracy",
-    "eval_f1",
-    "eval_precision",
-    "eval_recall",
-    "eval_loss",
-]
-
+metrics = ["eval_accuracy", "eval_f1", "eval_precision", "eval_recall", "eval_loss"]
 results = {m: [] for m in metrics}
 
 for seed in seeds:
     path = "./funsd-base-seed{}/eval_results.json".format(seed)
-
     print("\nSeed {}:".format(seed))
 
     if not os.path.exists(path):
@@ -101,7 +96,6 @@ print("FINAL FUNSD BASE RESULT: MEAN ± STD")
 print("=" * 70)
 
 summary = {}
-
 for metric in metrics:
     values = results[metric]
     if not values:
@@ -110,22 +104,11 @@ for metric in metrics:
 
     mean = np.mean(values)
     std = np.std(values, ddof=1) if len(values) > 1 else 0.0
+    print("{:18s}: {:.4f} ± {:.4f}".format(metric, mean, std))
 
-    print(
-        "{:18s}: {:.4f} ± {:.4f}".format(
-            metric,
-            mean,
-            std
-        )
-    )
+    summary[metric] = {"values": values, "mean": float(mean), "std": float(std)}
 
-    summary[metric] = {
-        "values": values,
-        "mean": float(mean),
-        "std": float(std),
-    }
-
-output_summary_file = "funsd_base_3seed_summary.json"
+output_summary_file = "cord_base_3seed_summary.json"
 with open(output_summary_file, "w") as f:
     json.dump(summary, f, indent=2)
 
