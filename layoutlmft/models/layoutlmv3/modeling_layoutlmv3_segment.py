@@ -158,7 +158,7 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
             t_pool = self._pool_text(text_hidden, seg_id, max_seg)
             if images is not None and sequence_output.shape[1] > text_len:
                 image_hidden = sequence_output[:, text_len+1:] # +1 để bỏ qua visual [CLS]
-                v_pool = self._pool_vision(image_hidden, seg_bbox)
+                v_pool = self._pool_vision(image_hidden, seg_bbox, seg_mask)
             else:
                 v_pool = torch.zeros_like(t_pool)
             
