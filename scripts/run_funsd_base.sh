@@ -29,7 +29,7 @@ do
     rm -rf "$OUT"
 
     # Giữ nguyên torch.distributed.launch như bản gốc để đảm bảo công bằng 100%
-    python examples/run_funsd_cord.py \
+    $PYTHON_CMD examples/run_funsd_cord.py \
       --dataset_name funsd \
       --do_train \
       --do_eval \
