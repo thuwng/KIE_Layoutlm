@@ -649,6 +649,34 @@ def main():
             for prediction, label in zip(predictions, labels)
         ]
 
+        # TẠO TRUE LABELS VÌ KỊCH BẢN GỐC CHƯA CÓ
+        true_labels = [
+            [label_list[l] for (p, l) in zip(prediction, label) if l != -100]
+            for prediction, label in zip(predictions, labels)
+        ]
+
+        # ========================================================
+        # XUẤT FILE ERROR ANALYSIS
+        # ========================================================
+        import csv
+        
+        error_file = os.path.join(training_args.output_dir, "error_analysis.csv")
+        original_tokens = test_dataset["words"] if "words" in test_dataset.column_names else test_dataset["tokens"]
+
+        if trainer.is_world_process_zero():
+            with open(error_file, "w", encoding="utf-8", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(["Doc_Index", "Token", "True_Label", "Predicted_Label"])
+                
+                for doc_idx, (preds, trues, tokens) in enumerate(zip(true_predictions, true_labels, original_tokens)):
+                    # Quét qua từng từ, nếu nhãn dự đoán khác nhãn gốc thì ghi vào file
+                    for i in range(min(len(preds), len(tokens), len(trues))):
+                        if preds[i] != trues[i]:
+                            writer.writerow([doc_idx, tokens[i], trues[i], preds[i]])
+                            
+            logger.info(f"\n[+] ĐÃ XUẤT FILE PHÂN TÍCH LỖI TẠI: {error_file}\n")
+        # ========================================================
+
         trainer.log_metrics("test", metrics)
         trainer.save_metrics("test", metrics)
 
