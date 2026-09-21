@@ -336,14 +336,16 @@ def main():
             padding=False,
             truncation=True,
             return_overflowing_tokens=True,
-            # We use this argument because the texts in our dataset are lists of words (with a label for each word).
             is_split_into_words=True,
         )
 
         labels = []
         bboxes = []
         images = []
-        # seg_ids = []  # NEW: per-token local segment index, for LayoutLMv3ForSegmentTokenClassification
+        seg_ids = []
+        is_firsts = []
+        seg_boxes_all = []
+
         for batch_index in range(len(tokenized_inputs["input_ids"])):
             word_ids = tokenized_inputs.word_ids(batch_index=batch_index)
             org_batch_index = tokenized_inputs["overflow_to_sample_mapping"][batch_index]
@@ -351,15 +353,6 @@ def main():
             label = examples[label_column_name][org_batch_index]
             bbox = examples["bboxes"][org_batch_index]
 
-            # NEW: recover the original FUNSD/CORD "item" (= segment) boundaries.
-            # funsd.py/cord.py assign an IDENTICAL line-level bbox to every word
-            # belonging to the same item, so grouping consecutive words with the
-            # same bbox tuple exactly reconstructs the gold segment groups --
-            # same trick used in the error-analysis script, no extra annotation
-            # needed.
-            # Only computed when --use_segment_head is set, so the baseline
-            # (vanilla LayoutLMv3ForTokenClassification, which has no `seg_id`
-            # argument in its forward()) never receives this extra batch key.
             word_seg_id = None
             if getattr(data_args, "use_segment_head", False):
                 word_seg_id = []
@@ -375,38 +368,8 @@ def main():
             previous_word_idx = None
             label_ids = []
             bbox_inputs = []
-            seg_id_inputs = []  # NEW
-            for word_idx in word_ids:
-                # Special tokens have a word id that is None. We set the label to -100 so they are automatically
-                # ignored in the loss function.
-                if word_idx is None:
-                    label_ids.append(-100)
-                    bbox_inputs.append([0, 0, 0, 0])
-                    if word_seg_id is not None:
-                        seg_id_inputs.append(-1)  # NEW: not part of any segment
-                # We set the label for the first token of each word.
-                elif word_idx != previous_word_idx:
-                    label_ids.append(label_to_id[label[word_idx]])
-                    bbox_inputs.append(bbox[word_idx])
-                    if word_seg_id is not None:
-                        seg_id_inputs.append(word_seg_id[word_idx])  # NEW
-                # For the other tokens in a word, we set the label to either the current label or -100, depending on
-                # the label_all_tokens flag.
-                else:
-                    label_ids.append(label_to_id[label[word_idx]] if data_args.label_all_tokens else -100)
-                    bbox_inputs.append(bbox[word_idx])
-                    if word_seg_id is not None:
-                        seg_id_inputs.append(word_seg_id[word_idx])  # NEW
-                previous_word_idx = word_idx
-            labels.append(label_ids)
-            bboxes.append(bbox_inputs)
-            # if word_seg_id is not None:
-                # seg_ids.append(seg_id_inputs)
-
-            label_ids = []
-            bbox_inputs = []
             seg_id_inputs = []
-            is_first_inputs = [] # THÊM MỚI: Đánh dấu B-token
+            is_first_inputs = []
 
             for word_idx in word_ids:
                 if word_idx is None:
@@ -415,17 +378,16 @@ def main():
                     if word_seg_id is not None:
                         seg_id_inputs.append(-1)
                         is_first_inputs.append(0)
-                elif word_idx != previous_word_idx: # Đây là token đầu tiên của 1 word
+                elif word_idx != previous_word_idx:
                     label_ids.append(label_to_id[label[word_idx]])
                     bbox_inputs.append(bbox[word_idx])
                     if word_seg_id is not None:
                         seg_id_inputs.append(word_seg_id[word_idx])
-                        # Kiểm tra xem đây có phải word đầu tiên của segment không
                         if len(seg_id_inputs) == 1 or seg_id_inputs[-1] != seg_id_inputs[-2]:
                             is_first_inputs.append(1)
                         else:
                             is_first_inputs.append(0)
-                else: # Các sub-token tiếp theo của word
+                else:
                     label_ids.append(label_to_id[label[word_idx]] if data_args.label_all_tokens else -100)
                     bbox_inputs.append(bbox[word_idx])
                     if word_seg_id is not None:
@@ -436,33 +398,40 @@ def main():
             labels.append(label_ids)
             bboxes.append(bbox_inputs)
 
-            # XỬ LÝ SEGMENT DATA MỚI (Bỏ build_edges)
             if word_seg_id is not None:
                 uniq_segs = sorted(list(set(x for x in seg_id_inputs if x >= 0)))
                 remap = {old: new for new, old in enumerate(uniq_segs)}
                 
                 mapped_seg_ids = [remap[x] if x >= 0 else -1 for x in seg_id_inputs]
-                tokenized_inputs.setdefault("seg_id", []).append(mapped_seg_ids)
-                tokenized_inputs.setdefault("is_first", []).append(is_first_inputs)
+                seg_ids.append(mapped_seg_ids)
+                is_firsts.append(is_first_inputs)
                 
-                # Trích xuất 1 Bounding Box tổng cho mỗi segment
                 seg_boxes = []
                 for s in uniq_segs:
                     bs = [bbox_inputs[k] for k in range(len(bbox_inputs)) if seg_id_inputs[k] == s]
                     if bs:
                         seg_boxes.append([min(b[0] for b in bs), min(b[1] for b in bs),
                                           max(b[2] for b in bs), max(b[3] for b in bs)])
-                
-                tokenized_inputs.setdefault("seg_bbox", []).append(seg_boxes)
+                seg_boxes_all.append(seg_boxes)
+            else:
+                seg_ids.append([])
+                is_firsts.append([])
+                seg_boxes_all.append([])
+
+            if data_args.visual_embed:
+                ipath = examples["image_path"][org_batch_index]
+                img = pil_loader(ipath)
+                for_patches, _ = common_transform(img, augmentation=augmentation)
+                patch = patch_transform(for_patches)
+                images.append(patch)
 
         tokenized_inputs["labels"] = labels
         tokenized_inputs["bbox"] = bboxes
         
-        # BỔ SUNG CÁC TRƯỜNG SEGMENT ĐỂ KHỚP ĐỘ DÀI VỚI HUGGINGFACE DATASETS
-        if word_seg_id is not None:
-            tokenized_inputs["seg_id"] = mapped_seg_ids
-            tokenized_inputs["is_first"] = is_first_inputs
-            tokenized_inputs["seg_bbox"] = seg_boxes
+        if getattr(data_args, "use_segment_head", False):
+            tokenized_inputs["seg_id"] = seg_ids
+            tokenized_inputs["is_first"] = is_firsts
+            tokenized_inputs["seg_bbox"] = seg_boxes_all
 
         if data_args.visual_embed:
             tokenized_inputs["images"] = images
