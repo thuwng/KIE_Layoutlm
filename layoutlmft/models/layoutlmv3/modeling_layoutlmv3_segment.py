@@ -1,33 +1,6 @@
-#layoutlmft/models/layoutlmv3/modeling_layoutlmv3_segment.py
-# coding=utf-8
-"""
-LayoutLMv3ForSegmentTokenClassification
-
-Core idea (grounded in error analysis on FUNSD + CORD):
-  - Segment self-consistency is already ~98-99% solved by the base model
-    (confirmed empirically) -> a consistency REGULARIZER has little to gain.
-  - The real errors are (a) whole segments classified wrong as a unit
-    (esp. long free-text spans dropped entirely via BIO "drift"), and
-    (b) confusions that depend on the NEIGHBORING segment's role
-    (HEADER vs QUESTION on FUNSD; parent vs sub-item on CORD).
-  - Fix: pool each segment's token hidden states into one vector, run a
-    tiny Transformer encoder over the SEQUENCE of segment vectors (reading
-    order) so adjacent segments exchange information, then broadcast the
-    context-enriched vector back to every token in the segment before the
-    (unchanged) token classifier.
-  - To keep the existing BIO scheme / seqeval / compute_metrics pipeline
-    100% unchanged, we do NOT collapse labels to entity-type-only. Instead
-    we add a tiny learned "is-first-token-of-segment" embedding so the
-    (otherwise identical) broadcast vector can still support the B-/I-
-    distinction at the classifier.
-
-This class does NOT touch attention, does NOT build any graph/hypergraph,
-and does NOT modify the pretrained backbone. It only replaces what the
-token classifier head "sees" for tokens inside multi-token segments -- an
-orthogonal mechanism to HGA / GraphLayoutLM.
-"""
 import torch
 import torch.nn as nn
+import math
 from torch.nn import CrossEntropyLoss
 from transformers.modeling_outputs import TokenClassifierOutput
 
@@ -36,155 +9,192 @@ from .modeling_layoutlmv3 import (
     LayoutLMv3Model,
     LayoutLMv3PreTrainedModel,
 )
-from .graph_module import SpatialGraphEncoder
+
+class SegmentSpatialAttention(nn.Module):
+    """ Cải tiến 2: 2D Spatial Bias Segment Transformer """
+    def __init__(self, hidden_size, num_heads=8, max_dist=128):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = hidden_size // num_heads
+        self.qkv = nn.Linear(hidden_size, hidden_size * 3)
+        self.proj = nn.Linear(hidden_size, hidden_size)
+        
+        # Bảng look-up khoảng cách x và y
+        self.x_bias = nn.Embedding(max_dist * 2 + 1, num_heads)
+        self.y_bias = nn.Embedding(max_dist * 2 + 1, num_heads)
+        self.max_dist = max_dist
+
+    def forward(self, x, seg_bbox, mask):
+        B, S, H = x.shape
+        qkv = self.qkv(x).reshape(B, S, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+
+        # Dot product attention
+        attn = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim) # [B, H, S, S]
+
+        # Tính khoảng cách tâm (Center Distance) cho spatial bias
+        cx = (seg_bbox[:, :, 0] + seg_bbox[:, :, 2]) / 2 # [B, S]
+        cy = (seg_bbox[:, :, 1] + seg_bbox[:, :, 3]) / 2
+        
+        # Scale về bucket (giả sử tọa độ 0-1000, chia lưới 20 pixel/bucket)
+        cx_b = (cx / 20).long()
+        cy_b = (cy / 20).long()
+        
+        dx = (cx_b.unsqueeze(2) - cx_b.unsqueeze(1)).clamp(-self.max_dist, self.max_dist) + self.max_dist
+        dy = (cy_b.unsqueeze(2) - cy_b.unsqueeze(1)).clamp(-self.max_dist, self.max_dist) + self.max_dist
+        
+        bias_x = self.x_bias(dx).permute(0, 3, 1, 2) # [B, H, S, S]
+        bias_y = self.y_bias(dy).permute(0, 3, 1, 2)
+        
+        attn = attn + bias_x + bias_y
+        
+        # Masking
+        attn_mask = mask.unsqueeze(1).unsqueeze(2) # [B, 1, 1, S]
+        attn = attn.masked_fill(~attn_mask, float('-inf'))
+        
+        attn = attn.softmax(dim=-1)
+        out = (attn @ v).transpose(1, 2).reshape(B, S, H)
+        return self.proj(out)
+
+class MultimodalSegmentEncoderLayer(nn.Module):
+    def __init__(self, hidden_size):
+        super().__init__()
+        self.attn = SegmentSpatialAttention(hidden_size)
+        self.ln1 = nn.LayerNorm(hidden_size)
+        self.ffn = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size * 2), nn.GELU(),
+            nn.Linear(hidden_size * 2, hidden_size), nn.Dropout(0.1)
+        )
+        self.ln2 = nn.LayerNorm(hidden_size)
+
+    def forward(self, x, seg_bbox, mask):
+        x = x + self.attn(self.ln1(x), seg_bbox, mask)
+        x = x + self.ffn(self.ln2(x))
+        return x
 
 class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
-    _keys_to_ignore_on_load_unexpected = [r"pooler"]
-    _keys_to_ignore_on_load_missing = [r"position_ids"]
-
     def __init__(self, config):
         super().__init__(config)
         self.num_labels = config.num_labels
-
         self.layoutlmv3 = LayoutLMv3Model(config)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
+        
         if config.num_labels < 10:
             self.classifier = nn.Linear(config.hidden_size, config.num_labels)
         else:
             self.classifier = LayoutLMv3ClassificationHead(config, pool_feature=False)
 
-        # Cấu hình cho sequence Transformer (nhánh A)
-        seg_ctx_layers = getattr(config, "segment_context_layers", 1)
-        seg_ctx_heads = getattr(config, "segment_context_heads", 4)
-        seg_ctx_dropout = getattr(config, "segment_context_dropout", config.hidden_dropout_prob)
-
-        # Thêm 2 lớp Linear để chiếu feature
-        self.ctx_proj = nn.Linear(config.hidden_size, config.hidden_size)
-        self.gph_proj = nn.Linear(config.hidden_size, config.hidden_size)
+        # Cải tiến 1: Fusion layer cho Text + Vision
+        self.multimodal_fusion = nn.Linear(config.hidden_size * 2, config.hidden_size)
         
-        # Khởi tạo trọng số bằng 0 để ban đầu hoạt động như identity
-        nn.init.zeros_(self.ctx_proj.weight)
-        nn.init.zeros_(self.ctx_proj.bias)
-        nn.init.zeros_(self.gph_proj.weight)
-        nn.init.zeros_(self.gph_proj.bias)
-
-        if seg_ctx_layers > 0:
-            encoder_layer = nn.TransformerEncoderLayer(
-                d_model=config.hidden_size,
-                nhead=seg_ctx_heads,
-                dim_feedforward=config.hidden_size * 2,
-                dropout=seg_ctx_dropout,
-                batch_first=True,
-            )
-            self.segment_context = nn.TransformerEncoder(encoder_layer, num_layers=seg_ctx_layers)
-        else:
-            self.segment_context = None
-
-    
-        max_pos = getattr(config, "segment_context_max_positions", 512)
-        self.segment_position_embedding = nn.Embedding(max_pos, config.hidden_size)
-        nn.init.normal_(self.segment_position_embedding.weight, mean=0.0, std=0.02)
-
-        # Cấu hình GNN (nhánh B)
-        self.graph_encoder = SpatialGraphEncoder(
-            config.hidden_size,
-            n_layers=getattr(config, "graph_layers", 2),
-            n_heads=getattr(config, "graph_heads", 4),
-            n_rel=8,
-            dropout=getattr(config, "graph_dropout", 0.1),
-        )
+        # Cải tiến 2: Segment Context Encoder
+        self.segment_encoder = MultimodalSegmentEncoderLayer(config.hidden_size)
+        
+        # Cải tiến 3: BIO-aware Gating
+        self.bio_embed = nn.Embedding(2, config.hidden_size)
+        self.gate_linear = nn.Linear(config.hidden_size * 2, config.hidden_size)
 
         self.init_weights()
 
-    def _init_weights(self, module):
-        super()._init_weights(module)
-        if module is getattr(self, "ctx_proj", None) or module is getattr(self, "gph_proj", None):
-            nn.init.zeros_(module.weight)
-            nn.init.zeros_(module.bias)
-
-    def _pool_segments(self, h, seg_id, max_seg):
+    def _pool_text(self, h, seg_id, max_seg):
         B, L, H = h.shape
         valid = (seg_id >= 0)
         idx = seg_id.clamp(min=0)
-
         cnt = torch.zeros(B, max_seg, device=h.device, dtype=h.dtype)
         cnt.scatter_add_(1, idx, valid.to(h.dtype))
-
         summ = torch.zeros(B, max_seg, H, device=h.device, dtype=h.dtype)
-        summ.scatter_add_(1, idx.unsqueeze(-1).expand(-1, -1, H),
-                        h * valid.unsqueeze(-1).to(h.dtype))
+        summ.scatter_add_(1, idx.unsqueeze(-1).expand(-1, -1, H), h * valid.unsqueeze(-1).to(h.dtype))
+        return summ / cnt.clamp(min=1).unsqueeze(-1)
 
-        seg_vec = summ / cnt.clamp(min=1).unsqueeze(-1)
-        seg_mask = cnt > 0
-        return seg_vec, seg_mask, idx, valid
+    def _pool_vision(self, image_hidden, seg_bbox):
+        """ Tính trung bình các Image Patch rơi vào trong vùng Segment Bounding Box """
+        B, max_seg, _ = seg_bbox.shape
+        _, N, H = image_hidden.shape
+        # LayoutLMv3 dùng lưới 14x14 (patch size 16 trên ảnh 224). N=196.
+        if N != 196:
+            return torch.zeros((B, max_seg, H), device=image_hidden.device)
 
-    def _broadcast_back(self, h, seg_ctx, idx, valid):
-        b = seg_ctx.gather(1, idx.unsqueeze(-1).expand(-1, -1, h.size(-1)))
-        return b * valid.unsqueeze(-1).to(h.dtype)
+        vision_patches = image_hidden.view(B, 14, 14, H)
+        
+        # Scale coord (0-1000) về lưới (0-14)
+        scaled_box = seg_bbox.float() / 1000.0 * 14.0
+        x0, y0 = scaled_box[..., 0].long().clamp(0, 13), scaled_box[..., 1].long().clamp(0, 13)
+        x1, y1 = scaled_box[..., 2].long().clamp(0, 13), scaled_box[..., 3].long().clamp(0, 13)
+        
+        out_v = torch.zeros(B, max_seg, H, device=image_hidden.device)
+        for b in range(B):
+            for s in range(max_seg):
+                if x0[b, s] == x1[b, s] and y0[b, s] == y1[b, s]: continue
+                # Trích xuất các patch nằm trong BBox của segment
+                patch_roi = vision_patches[b, y0[b,s]:y1[b,s]+1, x0[b,s]:x1[b,s]+1, :]
+                if patch_roi.numel() > 0:
+                    out_v[b, s] = patch_roi.mean(dim=(0,1))
+        return out_v
 
     def forward(
         self,
-        input_ids=None,
-        bbox=None,
-        attention_mask=None,
-        token_type_ids=None,
-        position_ids=None,
-        head_mask=None,
-        inputs_embeds=None,
-        labels=None,
-        output_attentions=None,
-        output_hidden_states=None,
-        return_dict=None,
-        images=None,          
-        valid_span=None,      
-        seg_id=None,
-        seg_rel=None,     
-        seg_mask=None,    
+        input_ids=None, bbox=None, attention_mask=None, token_type_ids=None,
+        position_ids=None, head_mask=None, inputs_embeds=None, labels=None,
+        output_attentions=None, output_hidden_states=None, return_dict=None,
+        images=None, valid_span=None, seg_id=None, seg_bbox=None, seg_mask=None, is_first=None
     ):
-        if seg_id is not None and seg_rel is None:
-            raise RuntimeError("seg_rel is None: Graph branch is skipping! "
-                           "Check remove_unused_columns in TrainingArguments.")
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         outputs = self.layoutlmv3(
-            input_ids,
-            bbox=bbox,
-            attention_mask=attention_mask,
-            token_type_ids=token_type_ids,
-            position_ids=position_ids,
-            head_mask=head_mask,
-            inputs_embeds=inputs_embeds,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-            images=images,
-            valid_span=valid_span,
+            input_ids, bbox=bbox, attention_mask=attention_mask, token_type_ids=token_type_ids,
+            position_ids=position_ids, head_mask=head_mask, inputs_embeds=inputs_embeds,
+            output_attentions=output_attentions, output_hidden_states=output_hidden_states,
+            return_dict=return_dict, images=images, valid_span=valid_span,
         )
 
         sequence_output = outputs[0]
         text_len = input_ids.shape[1]
         text_hidden = sequence_output[:, :text_len]
-        image_hidden = sequence_output[:, text_len:]
-
-        if seg_id is not None and seg_rel is not None and seg_mask is not None:
-            max_seg_in_batch = seg_rel.size(1)
-            seg_vec, current_seg_mask, idx, valid = self._pool_segments(text_hidden, seg_id, max_seg_in_batch)
-
-            pos = torch.arange(seg_vec.size(1), device=seg_vec.device).clamp(max=self.segment_position_embedding.num_embeddings - 1)
-            ctx = self.segment_context(
-                seg_vec + self.segment_position_embedding(pos),
-                src_key_padding_mask=~current_seg_mask
-            )
-
-            gph = self.graph_encoder(seg_vec, seg_rel, current_seg_mask)
-
-            seg_ctx = self.ctx_proj(ctx - seg_vec) + self.gph_proj(gph - seg_vec)
-
-            broadcast_ctx = self._broadcast_back(text_hidden, seg_ctx, idx, valid)
-            text_hidden = text_hidden + broadcast_ctx 
+        
+        # Nếu có segment info
+        if seg_id is not None and seg_bbox is not None and seg_mask is not None:
+            max_seg = seg_bbox.size(1)
             
-        if image_hidden.shape[1] > 0:
-            pooled_sequence = torch.cat([text_hidden, image_hidden], dim=1)
+            # Cải tiến 1: Multimodal Pooling
+            t_pool = self._pool_text(text_hidden, seg_id, max_seg)
+            if images is not None and sequence_output.shape[1] > text_len:
+                image_hidden = sequence_output[:, text_len+1:] # +1 để bỏ qua visual [CLS]
+                v_pool = self._pool_vision(image_hidden, seg_bbox)
+            else:
+                v_pool = torch.zeros_like(t_pool)
+            
+            seg_vec = self.multimodal_fusion(torch.cat([t_pool, v_pool], dim=-1))
+            
+            # Cải tiến 4: Graph-level Structural Dropout
+            if self.training:
+                # Ngẫu nhiên "che" 15% các segment để ép mô hình đọc ngữ cảnh xa hơn
+                drop_mask = torch.rand((seg_vec.size(0), max_seg), device=seg_vec.device) > 0.15
+                active_seg_mask = seg_mask & drop_mask
+            else:
+                active_seg_mask = seg_mask
+
+            # Cải tiến 2: 2D Bias Transformer
+            seg_ctx = self.segment_encoder(seg_vec, seg_bbox, active_seg_mask)
+
+            # Khôi phục vector từ Segment về Token
+            idx = seg_id.clamp(min=0)
+            valid = (seg_id >= 0)
+            broadcast_ctx = seg_ctx.gather(1, idx.unsqueeze(-1).expand(-1, -1, text_hidden.size(-1)))
+            broadcast_ctx = broadcast_ctx * valid.unsqueeze(-1).to(text_hidden.dtype)
+            
+            # Cải tiến 3: BIO-Aware Gating Fusion
+            if is_first is not None:
+                bio_bias = self.bio_embed(is_first)
+                broadcast_ctx = broadcast_ctx + bio_bias
+            
+            gate_input = torch.cat([text_hidden, broadcast_ctx], dim=-1)
+            gate = torch.sigmoid(self.gate_linear(gate_input))
+            
+            # Fuse mềm mại, giữ lại đặc trưng từ vựng
+            text_hidden = gate * text_hidden + (1 - gate) * broadcast_ctx
+            
+        if images is not None and sequence_output.shape[1] > text_len:
+            pooled_sequence = torch.cat([text_hidden, sequence_output[:, text_len:]], dim=1)
         else:
             pooled_sequence = text_hidden
 
@@ -197,9 +207,7 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
             if attention_mask is not None:
                 active_loss = attention_mask.view(-1) == 1
                 active_logits = logits.view(-1, self.num_labels)
-                active_labels = torch.where(
-                    active_loss, labels.view(-1), torch.tensor(loss_fct.ignore_index).type_as(labels)
-                )
+                active_labels = torch.where(active_loss, labels.view(-1), torch.tensor(loss_fct.ignore_index).type_as(labels))
                 loss = loss_fct(active_logits, active_labels)
             else:
                 loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
@@ -208,9 +216,4 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
             output = (logits,) + outputs[2:]
             return ((loss,) + output) if loss is not None else output
 
-        return TokenClassifierOutput(
-            loss=loss,
-            logits=logits,
-            hidden_states=outputs.hidden_states,
-            attentions=outputs.attentions,
-        )
+        return TokenClassifierOutput(loss=loss, logits=logits, hidden_states=outputs.hidden_states, attentions=outputs.attentions)

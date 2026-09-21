@@ -404,48 +404,60 @@ def main():
             # if word_seg_id is not None:
                 # seg_ids.append(seg_id_inputs)
 
-            # THÊM MỚI: Build Graph
+            label_ids = []
+            bbox_inputs = []
+            seg_id_inputs = []
+            is_first_inputs = [] # THÊM MỚI: Đánh dấu B-token
+
+            for word_idx in word_ids:
+                if word_idx is None:
+                    label_ids.append(-100)
+                    bbox_inputs.append([0, 0, 0, 0])
+                    if word_seg_id is not None:
+                        seg_id_inputs.append(-1)
+                        is_first_inputs.append(0)
+                elif word_idx != previous_word_idx: # Đây là token đầu tiên của 1 word
+                    label_ids.append(label_to_id[label[word_idx]])
+                    bbox_inputs.append(bbox[word_idx])
+                    if word_seg_id is not None:
+                        seg_id_inputs.append(word_seg_id[word_idx])
+                        # Kiểm tra xem đây có phải word đầu tiên của segment không
+                        if len(seg_id_inputs) == 1 or seg_id_inputs[-1] != seg_id_inputs[-2]:
+                            is_first_inputs.append(1)
+                        else:
+                            is_first_inputs.append(0)
+                else: # Các sub-token tiếp theo của word
+                    label_ids.append(label_to_id[label[word_idx]] if data_args.label_all_tokens else -100)
+                    bbox_inputs.append(bbox[word_idx])
+                    if word_seg_id is not None:
+                        seg_id_inputs.append(word_seg_id[word_idx])
+                        is_first_inputs.append(0)
+                previous_word_idx = word_idx
+
+            labels.append(label_ids)
+            bboxes.append(bbox_inputs)
+
+            # XỬ LÝ SEGMENT DATA MỚI (Bỏ build_edges)
             if word_seg_id is not None:
+                uniq_segs = sorted(list(set(x for x in seg_id_inputs if x >= 0)))
+                remap = {old: new for new, old in enumerate(uniq_segs)}
+                
+                mapped_seg_ids = [remap[x] if x >= 0 else -1 for x in seg_id_inputs]
+                tokenized_inputs.setdefault("seg_id", []).append(mapped_seg_ids)
+                tokenized_inputs.setdefault("is_first", []).append(is_first_inputs)
+                
+                # Trích xuất 1 Bounding Box tổng cho mỗi segment
                 seg_boxes = []
-                max_sid = max(word_seg_id) if len(word_seg_id) > 0 else -1
-                for s in range(max_sid + 1):
-                    bs = [bbox[k] for k in range(len(bbox)) if word_seg_id[k] == s]
+                for s in uniq_segs:
+                    bs = [bbox_inputs[k] for k in range(len(bbox_inputs)) if seg_id_inputs[k] == s]
                     if bs:
                         seg_boxes.append([min(b[0] for b in bs), min(b[1] for b in bs),
                                           max(b[2] for b in bs), max(b[3] for b in bs)])
-                    else:
-                        seg_boxes.append([0, 0, 0, 0])
                 
-                src, dst, rel = build_edges(seg_boxes)
-
-                uniq = sorted(list(set(x for x in seg_id_inputs if x >= 0)))
-                remap = {old: new for new, old in enumerate(uniq)}
-                
-                tokenized_inputs.setdefault("seg_id", []).append([remap[x] if x >= 0 else -1 for x in seg_id_inputs])
-                
-                chunk_src, chunk_dst, chunk_rel = [], [], []
-                for s_node, d_node, r_type in zip(src, dst, rel):
-                    if s_node in remap and d_node in remap:
-                        chunk_src.append(remap[s_node])
-                        chunk_dst.append(remap[d_node])
-                        chunk_rel.append(r_type)
-                
-                tokenized_inputs.setdefault("edge_src", []).append(chunk_src)
-                tokenized_inputs.setdefault("edge_dst", []).append(chunk_dst)
-                tokenized_inputs.setdefault("edge_rel", []).append(chunk_rel)
-                tokenized_inputs.setdefault("n_seg", []).append(len(uniq))
-
-            if data_args.visual_embed:
-                ipath = examples["image_path"][org_batch_index]
-                img = pil_loader(ipath)
-                for_patches, _ = common_transform(img, augmentation=augmentation)
-                patch = patch_transform(for_patches)
-                images.append(patch)
+                tokenized_inputs.setdefault("seg_bbox", []).append(seg_boxes)
 
         tokenized_inputs["labels"] = labels
         tokenized_inputs["bbox"] = bboxes
-        # if getattr(data_args, "use_segment_head", False):
-            # tokenized_inputs["seg_id"] = seg_ids  # NEW
         if data_args.visual_embed:
             tokenized_inputs["images"] = images
 
@@ -682,7 +694,7 @@ def main():
                             
             logger.info(f"\n[+] ĐÃ XUẤT FILE PHÂN TÍCH LỖI TẠI: {error_file}\n")
         # ========================================================
-        
+
         trainer.log_metrics("test", metrics)
         trainer.save_metrics("test", metrics)
 
