@@ -79,7 +79,7 @@ metrics = [
 results = {m: [] for m in metrics}
 
 for seed in seeds:
-    path = "./funsd-base88-seed{}/eval_results.json".format(seed)
+    path = "./funsd-base-seed{}/eval_results.json".format(seed)
 
     print("\nSeed {}:".format(seed))
 

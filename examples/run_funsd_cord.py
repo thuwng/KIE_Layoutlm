@@ -403,7 +403,38 @@ def main():
             labels.append(label_ids)
             bboxes.append(bbox_inputs)
             if word_seg_id is not None:
-                seg_ids.append(seg_id_inputs)  # NEW
+                seg_ids.append(seg_id_inputs)
+
+            # THÊM MỚI: Build Graph
+            if word_seg_id is not None:
+                seg_boxes = []
+                max_sid = max(word_seg_id) if len(word_seg_id) > 0 else -1
+                for s in range(max_sid + 1):
+                    bs = [bbox[k] for k in range(len(bbox)) if word_seg_id[k] == s]
+                    if bs:
+                        seg_boxes.append([min(b[0] for b in bs), min(b[1] for b in bs),
+                                          max(b[2] for b in bs), max(b[3] for b in bs)])
+                    else:
+                        seg_boxes.append([0, 0, 0, 0])
+                
+                src, dst, rel = build_edges(seg_boxes)
+
+                uniq = sorted(list(set(x for x in seg_id_inputs if x >= 0)))
+                remap = {old: new for new, old in enumerate(uniq)}
+                
+                tokenized_inputs.setdefault("seg_id", []).append([remap[x] if x >= 0 else -1 for x in seg_id_inputs])
+                
+                chunk_src, chunk_dst, chunk_rel = [], [], []
+                for s_node, d_node, r_type in zip(src, dst, rel):
+                    if s_node in remap and d_node in remap:
+                        chunk_src.append(remap[s_node])
+                        chunk_dst.append(remap[d_node])
+                        chunk_rel.append(r_type)
+                
+                tokenized_inputs.setdefault("edge_src", []).append(chunk_src)
+                tokenized_inputs.setdefault("edge_dst", []).append(chunk_dst)
+                tokenized_inputs.setdefault("edge_rel", []).append(chunk_rel)
+                tokenized_inputs.setdefault("n_seg", []).append(len(uniq))
 
             if data_args.visual_embed:
                 ipath = examples["image_path"][org_batch_index]
@@ -512,18 +543,23 @@ def main():
     class CustomTrainer(Trainer):
         def create_optimizer(self):
             if self.optimizer is None:
-                # Nhóm 1: Các tham số thuộc backbone LayoutLMv3
-                backbone_params = [p for n, p in self.model.named_parameters() if "layoutlmv3" in n and p.requires_grad]
-                # Nhóm 2: Các tham số mới (segment_context, classifier, is_first_token_embedding, gate)
-                new_params = [p for n, p in self.model.named_parameters() if "layoutlmv3" not in n and p.requires_grad]
-
-                optimizer_grouped_parameters = [
-                    {"params": backbone_params, "lr": self.args.learning_rate}, # Dùng LR từ tham số truyền vào (VD: 1e-5)
-                    {"params": new_params, "lr":5e-4} # Ép cứng LR lớn hơn cho module mới
-                ]
+                no_decay = ["bias", "LayerNorm.weight", "layer_norm", "gate"]
+                def is_backbone(n): return "layoutlmv3" in n
                 
+                groups = []
+                for bb in (True, False):
+                    for nd in (True, False):
+                        ps = [p for n, p in self.model.named_parameters()
+                              if p.requires_grad and is_backbone(n) == bb
+                              and any(x in n for x in no_decay) == nd]
+                        if ps:
+                            groups.append({
+                                "params": ps,
+                                "lr": self.args.learning_rate if bb else getattr(data_args, "new_module_lr", 2e-4),
+                                "weight_decay": 0.0 if nd else self.args.weight_decay,
+                            })
                 self.optimizer = torch.optim.AdamW(
-                    optimizer_grouped_parameters, 
+                    groups, 
                     betas=(self.args.adam_beta1, self.args.adam_beta2),
                     eps=self.args.adam_epsilon,
                 )

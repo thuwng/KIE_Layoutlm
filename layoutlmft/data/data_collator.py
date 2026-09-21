@@ -23,39 +23,64 @@ def pre_calc_rel_mat(segment_ids):
 
 @dataclass
 class DataCollatorForKeyValueExtraction(DataCollatorMixin):
-    """
-    Data collator that will dynamically pad the inputs received, as well as the labels.
-    Args:
-        tokenizer (:class:`~transformers.PreTrainedTokenizer` or :class:`~transformers.PreTrainedTokenizerFast`):
-            The tokenizer used for encoding the data.
-        padding (:obj:`bool`, :obj:`str` or :class:`~transformers.file_utils.PaddingStrategy`, `optional`, defaults to :obj:`True`):
-            Select a strategy to pad the returned sequences (according to the model's padding side and padding index)
-            among:
-            * :obj:`True` or :obj:`'longest'`: Pad to the longest sequence in the batch (or no padding if only a single
-              sequence if provided).
-            * :obj:`'max_length'`: Pad to a maximum length specified with the argument :obj:`max_length` or to the
-              maximum acceptable input length for the model if that argument is not provided.
-            * :obj:`False` or :obj:`'do_not_pad'` (default): No padding (i.e., can output a batch with sequences of
-              different lengths).
-        max_length (:obj:`int`, `optional`):
-            Maximum length of the returned list and optionally padding length (see above).
-        pad_to_multiple_of (:obj:`int`, `optional`):
-            If set will pad the sequence to a multiple of the provided value.
-            This is especially useful to enable the use of Tensor Cores on NVIDIA hardware with compute capability >=
-            7.5 (Volta).
-        label_pad_token_id (:obj:`int`, `optional`, defaults to -100):
-            The id to use when padding the labels (-100 will be automatically ignore by PyTorch loss functions).
-    """
-
     tokenizer: PreTrainedTokenizerBase
     padding: Union[bool, str, PaddingStrategy] = True
     max_length: Optional[int] = None
     pad_to_multiple_of: Optional[int] = None
     label_pad_token_id: int = -100
+    structural_mask_prob: float = 0.1  # THÊM MỚI
+    training: bool = True              # THÊM MỚI
 
     def __call__(self, features):
         label_name = "label" if "label" in features[0].keys() else "labels"
-        labels = [feature[label_name] for feature in features] if label_name in features[0].keys() else None
+        labels = [feature.pop(label_name) for feature in features] if label_name in features[0].keys() else None
+
+        # --- BÓC TÁCH CÁC TRƯỜNG ĐỒ THỊ ---
+        edge_src = [feature.pop("edge_src") for feature in features] if "edge_src" in features[0] else None
+        edge_dst = [feature.pop("edge_dst") for feature in features] if "edge_dst" in features[0] else None
+        edge_rel = [feature.pop("edge_rel") for feature in features] if "edge_rel" in features[0] else None
+        n_seg = [feature.pop("n_seg") for feature in features] if "n_seg" in features[0] else None
+
+        images = None
+        if "images" in features[0]:
+            images = torch.stack([torch.tensor(d.pop("images")) for d in features])
+            IMAGE_LEN = int(images.shape[-1] / 16) * int(images.shape[-1] / 16) + 1
+
+        batch = self.tokenizer.pad(
+            features,
+            padding=self.padding,
+            max_length=self.max_length,
+            pad_to_multiple_of=self.pad_to_multiple_of,
+            return_tensors="pt",
+        )
+
+        # --- XỬ LÝ STRUCTURAL DROPOUT ---
+        if self.structural_mask_prob > 0 and self.training and "seg_id" in batch:
+            B = batch["input_ids"].size(0)
+            for b in range(B):
+                sid = batch["seg_id"][b]
+                uniq = sid[sid >= 0].unique()
+                if len(uniq) < 3:
+                    continue
+                n = max(1, int(self.structural_mask_prob * len(uniq)))
+                chosen = uniq[torch.randperm(len(uniq))[:n]]
+                hit = torch.isin(sid, chosen)
+                batch["input_ids"][b][hit] = self.tokenizer.mask_token_id
+
+        # --- DỰNG MA TRẬN ĐỒ THỊ ---
+        if edge_src is not None:
+            B = len(features)
+            S = max(n_seg) if n_seg else 1
+            rel_mat = torch.zeros((B, S, S), dtype=torch.long)
+            seg_mask_tensor = torch.zeros((B, S), dtype=torch.bool)
+            
+            for b in range(B):
+                if len(edge_src[b]) > 0:
+                    rel_mat[b, edge_src[b], edge_dst[b]] = torch.tensor(edge_rel[b], dtype=torch.long)
+                seg_mask_tensor[b, :n_seg[b]] = True
+                
+            batch["seg_rel"] = rel_mat
+            batch["seg_mask"] = seg_mask_tensor
 
         images = None
         if "images" in features[0]:
