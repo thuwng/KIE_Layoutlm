@@ -36,6 +36,7 @@ from .modeling_layoutlmv3 import (
     LayoutLMv3Model,
     LayoutLMv3PreTrainedModel,
 )
+from .graph_module import SpatialGraphEncoder
 
 class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
     _keys_to_ignore_on_load_unexpected = [r"pooler"]
@@ -89,6 +90,41 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
         self.init_weights()
         # for param in self.layoutlmv3.parameters():
         #     param.requires_grad = False
+
+        self.segment_context_gate = nn.Parameter(torch.zeros(1))
+        self.graph_gate = nn.Parameter(torch.zeros(1))
+
+        # Tăng max_positions nếu cần (sửa trực tiếp cấu hình truyền vào hoặc hardcode tạm cho cấu trúc segment)
+        max_pos = getattr(config, "segment_context_max_positions", 512) 
+        self.segment_position_embedding = nn.Embedding(max_pos, config.hidden_size)
+
+        self.graph_encoder = SpatialGraphEncoder(
+            config.hidden_size,
+            n_layers=getattr(config, "graph_layers", 2),
+            n_heads=getattr(config, "graph_heads", 4),
+            n_rel=8,
+            dropout=getattr(config, "graph_dropout", 0.1),
+        )
+
+    def _pool_segments(self, h, seg_id, max_seg):
+        B, L, H = h.shape
+        valid = (seg_id >= 0)
+        idx = seg_id.clamp(min=0)
+
+        cnt = torch.zeros(B, max_seg, device=h.device, dtype=h.dtype)
+        cnt.scatter_add_(1, idx, valid.to(h.dtype))
+
+        summ = torch.zeros(B, max_seg, H, device=h.device, dtype=h.dtype)
+        summ.scatter_add_(1, idx.unsqueeze(-1).expand(-1, -1, H),
+                        h * valid.unsqueeze(-1).to(h.dtype))
+
+        seg_vec = summ / cnt.clamp(min=1).unsqueeze(-1)
+        seg_mask = cnt > 0
+        return seg_vec, seg_mask, idx, valid
+
+    def _broadcast_back(self, h, seg_ctx, idx, valid):
+        b = seg_ctx.gather(1, idx.unsqueeze(-1).expand(-1, -1, h.size(-1)))
+        return b * valid.unsqueeze(-1).to(h.dtype)
 
     def _segment_pool_and_contextualize(self, text_hidden, seg_id):
         """
@@ -148,15 +184,16 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
         attention_mask=None,
         token_type_ids=None,
         position_ids=None,
-        valid_span=None,
         head_mask=None,
         inputs_embeds=None,
         labels=None,
-        seg_id=None,  # NEW input: (batch, text_seq_len), see docstring above
         output_attentions=None,
         output_hidden_states=None,
         return_dict=None,
-        images=None,
+        pixel_values=None,
+        seg_id=None,
+        seg_rel=None,     
+        seg_mask=None,    
     ):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
@@ -177,28 +214,30 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
 
         sequence_output = outputs[0]  # (B, text_len + image_len, H)
         text_len = input_ids.shape[1]
-        text_hidden = sequence_output[:, :text_len, :]
+        text_hidden = outputs[0][:, : seq_length]
         image_hidden = sequence_output[:, text_len:, :]
 
-        if seg_id is not None:
-            text_hidden = self._segment_pool_and_contextualize(text_hidden, seg_id)
+        if seg_id is not None and seg_rel is not None and seg_mask is not None:
+            max_seg_in_batch = seg_rel.size(1)
+            seg_vec, current_seg_mask, idx, valid = self._pool_segments(text_hidden, seg_id, max_seg_in_batch)
 
-            # Add the is-first-token-of-segment signal so the classifier can
-            # still distinguish B- from I- despite the shared pooled vector.
-            is_first = torch.zeros_like(seg_id, dtype=torch.long)
-            is_first[:, 0] = 0  # position 0 is always a special token ([CLS]) -> irrelevant, seg_id=-1 there anyway
-            if seg_id.shape[1] > 1:
-                prev = seg_id[:, :-1]
-                cur = seg_id[:, 1:]
-                changed = (cur != prev) & (cur >= 0)
-                is_first[:, 1:] = changed.long()
-            # A token whose seg_id == -1 (special/pad) is never "first of a segment".
-            is_first = is_first * (seg_id >= 0).long()
+            # Nhánh A: Reading-order Transformer (hiện có, thêm padding mask)
+            pos = torch.arange(seg_vec.size(1), device=seg_vec.device).clamp(max=self.segment_position_embedding.num_embeddings - 1)
+            ctx = self.segment_context(
+                seg_vec + self.segment_position_embedding(pos),
+                src_key_padding_mask=~current_seg_mask
+            )
 
-            text_hidden = text_hidden + self.is_first_token_embedding(is_first)
-        # if seg_id is None (e.g. an old checkpoint / different dataloader),
-        # fall back to plain per-token behavior -- text_hidden is untouched.
+            # Nhánh B: Spatial Graph
+            gph = self.graph_encoder(seg_vec, seg_rel, current_seg_mask)
 
+            # Fuse: 2 gate độc lập (bảo toàn text_hidden gốc)
+            seg_ctx = (self.segment_context_gate * (ctx - seg_vec)
+                    + self.graph_gate * (gph - seg_vec))
+
+            broadcast_ctx = self._broadcast_back(text_hidden, seg_ctx, idx, valid)
+            text_hidden = text_hidden + broadcast_ctx # Residual connection thực sự
+            
         if image_hidden.shape[1] > 0:
             pooled_sequence = torch.cat([text_hidden, image_hidden], dim=1)
         else:
