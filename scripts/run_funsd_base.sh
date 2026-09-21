@@ -2,9 +2,9 @@
 
 set -e
 
-cd /home/s24gbn1/Documents/thuwng/layoutlmv3_1
+cd /kaggle/working/KIE_Layoutlm
 
-export PYTHONPATH="/home/s24gbn1/Documents/thuwng/layoutlmv3_1:$PYTHONPATH"
+export PYTHONPATH="/kaggle/working/KIE_Layoutlm:$PYTHONPATH"
 export TOKENIZERS_PARALLELISM=false
 export WANDB_PROJECT="FUNSD-Base-Experiment"
 
@@ -125,7 +125,7 @@ for metric in metrics:
         "std": float(std),
     }
 
-output_summary_file = "cord_base88_3seed_summary.json"
+output_summary_file = "funsd_base_3seed_summary.json"
 with open(output_summary_file, "w") as f:
     json.dump(summary, f, indent=2)
 
