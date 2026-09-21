@@ -48,7 +48,6 @@ do
       --evaluation_strategy steps \
       --eval_steps 100 \
       --learning_rate 1e-5 \
-      --new_module_lr 2e-4 \
       --warmup_ratio 0.1 \
       --per_device_train_batch_size 2 \
       --gradient_accumulation_steps 8 \
