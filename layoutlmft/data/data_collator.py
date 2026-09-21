@@ -32,6 +32,9 @@ class DataCollatorForKeyValueExtraction(DataCollatorMixin):
     training: bool = True              # THÊM MỚI
 
     def __call__(self, features):
+        for f in features:
+            f.pop("overflow_to_sample_mapping", None)
+
         label_name = "label" if "label" in features[0].keys() else "labels"
         labels = [feature.pop(label_name) for feature in features] if label_name in features[0].keys() else None
 

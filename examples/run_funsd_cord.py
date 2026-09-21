@@ -5,7 +5,6 @@ import os
 import sys
 from dataclasses import dataclass, field
 from typing import Optional
-
 import numpy as np
 from datasets import ClassLabel, load_dataset
 import evaluate
@@ -345,7 +344,7 @@ def main():
         labels = []
         bboxes = []
         images = []
-        seg_ids = []  # NEW: per-token local segment index, for LayoutLMv3ForSegmentTokenClassification
+        # seg_ids = []  # NEW: per-token local segment index, for LayoutLMv3ForSegmentTokenClassification
         for batch_index in range(len(tokenized_inputs["input_ids"])):
             word_ids = tokenized_inputs.word_ids(batch_index=batch_index)
             org_batch_index = tokenized_inputs["overflow_to_sample_mapping"][batch_index]
@@ -402,8 +401,8 @@ def main():
                 previous_word_idx = word_idx
             labels.append(label_ids)
             bboxes.append(bbox_inputs)
-            if word_seg_id is not None:
-                seg_ids.append(seg_id_inputs)
+            # if word_seg_id is not None:
+                # seg_ids.append(seg_id_inputs)
 
             # THÊM MỚI: Build Graph
             if word_seg_id is not None:
@@ -445,8 +444,8 @@ def main():
 
         tokenized_inputs["labels"] = labels
         tokenized_inputs["bbox"] = bboxes
-        if getattr(data_args, "use_segment_head", False):
-            tokenized_inputs["seg_id"] = seg_ids  # NEW
+        # if getattr(data_args, "use_segment_head", False):
+            # tokenized_inputs["seg_id"] = seg_ids  # NEW
         if data_args.visual_embed:
             tokenized_inputs["images"] = images
 
@@ -538,8 +537,17 @@ def main():
                 "f1": results["overall_f1"],
                 "accuracy": results["overall_accuracy"],
             }
-    import torch
-    # Định nghĩa Trainer tùy chỉnh để tách biệt Learning Rate
+
+    # 1. Khởi tạo collator riêng cho eval (tắt training mode)
+    eval_collator = DataCollatorForKeyValueExtraction(
+        tokenizer,
+        pad_to_multiple_of=8 if training_args.fp16 else None,
+        padding=padding,
+        max_length=512,
+        training=False  # QUAN TRỌNG: Tắt structural dropout
+    )
+
+    # Định nghĩa Trainer tùy chỉnh để tách biệt Learning Rate và dùng eval_collator
     class CustomTrainer(Trainer):
         def create_optimizer(self):
             if self.optimizer is None:
@@ -565,14 +573,28 @@ def main():
                 )
             return self.optimizer
 
-    # Khởi tạo Trainer bằng CustomTrainer vừa tạo thay vì Trainer mặc định
+        # 2. Thêm các hàm để dùng collator riêng cho eval
+        def _eval_c(self, fn, ds):
+            tr_collator = self.data_collator
+            self.data_collator = eval_collator
+            res = fn(ds)
+            self.data_collator = tr_collator
+            return res
+
+        def get_eval_dataloader(self, eval_dataset=None):
+            return self._eval_c(super().get_eval_dataloader, eval_dataset)
+
+        def get_test_dataloader(self, test_dataset):
+            return self._eval_c(super().get_test_dataloader, test_dataset)
+
+    # 3. Khởi tạo Trainer bằng CustomTrainer vừa tạo thay vì Trainer mặc định
     trainer = CustomTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset if training_args.do_train else None,
         eval_dataset=eval_dataset if training_args.do_eval else None,
         tokenizer=tokenizer,
-        data_collator=data_collator,
+        data_collator=data_collator, # Đây là train_collator
         compute_metrics=compute_metrics,
     )
     # Initialize our Trainer

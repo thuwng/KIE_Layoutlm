@@ -48,10 +48,12 @@ do
       --evaluation_strategy steps \
       --eval_steps 100 \
       --learning_rate 1e-5 \
+      --new_module_lr 2e-4 \
       --warmup_ratio 0.1 \
       --per_device_train_batch_size 2 \
       --gradient_accumulation_steps 8 \
       --dataloader_num_workers 4 \
+      --remove_unused_columns False \
       --report_to none \
       --run_name "FUNSD-LR-Split-seed${SEED}" \
       --seed "$SEED" \
@@ -108,7 +110,7 @@ for metric in metrics:
 
     summary[metric] = {"values": values, "mean": float(mean), "std": float(std)}
 
-output_summary_file = "cord_base_3seed_summary.json"
+output_summary_file = "funsd_base_3seed_summary.json"
 with open(output_summary_file, "w") as f:
     json.dump(summary, f, indent=2)
 

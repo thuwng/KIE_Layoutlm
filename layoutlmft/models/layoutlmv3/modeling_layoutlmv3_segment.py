@@ -58,6 +58,16 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
         seg_ctx_heads = getattr(config, "segment_context_heads", 4)
         seg_ctx_dropout = getattr(config, "segment_context_dropout", config.hidden_dropout_prob)
 
+        # Thêm 2 lớp Linear để chiếu feature
+        self.ctx_proj = nn.Linear(config.hidden_size, config.hidden_size)
+        self.gph_proj = nn.Linear(config.hidden_size, config.hidden_size)
+        
+        # Khởi tạo trọng số bằng 0 để ban đầu hoạt động như identity
+        nn.init.zeros_(self.ctx_proj.weight)
+        nn.init.zeros_(self.ctx_proj.bias)
+        nn.init.zeros_(self.gph_proj.weight)
+        nn.init.zeros_(self.gph_proj.bias)
+
         if seg_ctx_layers > 0:
             encoder_layer = nn.TransformerEncoderLayer(
                 d_model=config.hidden_size,
@@ -70,15 +80,10 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
         else:
             self.segment_context = None
 
-        self.segment_context_gate = nn.Parameter(torch.zeros(1))
-        self.graph_gate = nn.Parameter(torch.zeros(1))
-        
+    
         max_pos = getattr(config, "segment_context_max_positions", 512)
         self.segment_position_embedding = nn.Embedding(max_pos, config.hidden_size)
         nn.init.normal_(self.segment_position_embedding.weight, mean=0.0, std=0.02)
-
-        self.is_first_token_embedding = nn.Embedding(2, config.hidden_size)
-        nn.init.normal_(self.is_first_token_embedding.weight, mean=0.0, std=0.02)
 
         # Cấu hình GNN (nhánh B)
         self.graph_encoder = SpatialGraphEncoder(
@@ -90,6 +95,12 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
         )
 
         self.init_weights()
+
+    def _init_weights(self, module):
+        super()._init_weights(module)
+        if module is getattr(self, "ctx_proj", None) or module is getattr(self, "gph_proj", None):
+            nn.init.zeros_(module.weight)
+            nn.init.zeros_(module.bias)
 
     def _pool_segments(self, h, seg_id, max_seg):
         B, L, H = h.shape
@@ -130,6 +141,9 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
         seg_rel=None,     
         seg_mask=None,    
     ):
+        if seg_id is not None and seg_rel is None:
+            raise RuntimeError("seg_rel is None: Graph branch is skipping! "
+                           "Check remove_unused_columns in TrainingArguments.")
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         outputs = self.layoutlmv3(
@@ -164,8 +178,7 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
 
             gph = self.graph_encoder(seg_vec, seg_rel, current_seg_mask)
 
-            seg_ctx = (self.segment_context_gate * (ctx - seg_vec)
-                    + self.graph_gate * (gph - seg_vec))
+            seg_ctx = self.ctx_proj(ctx - seg_vec) + self.gph_proj(gph - seg_vec)
 
             broadcast_ctx = self._broadcast_back(text_hidden, seg_ctx, idx, valid)
             text_hidden = text_hidden + broadcast_ctx 
