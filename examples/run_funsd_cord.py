@@ -457,6 +457,13 @@ def main():
 
         tokenized_inputs["labels"] = labels
         tokenized_inputs["bbox"] = bboxes
+        
+        # BỔ SUNG CÁC TRƯỜNG SEGMENT ĐỂ KHỚP ĐỘ DÀI VỚI HUGGINGFACE DATASETS
+        if word_seg_id is not None:
+            tokenized_inputs["seg_id"] = mapped_seg_ids
+            tokenized_inputs["is_first"] = is_first_inputs
+            tokenized_inputs["seg_bbox"] = seg_boxes
+
         if data_args.visual_embed:
             tokenized_inputs["images"] = images
 
