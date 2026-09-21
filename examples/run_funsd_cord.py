@@ -656,12 +656,18 @@ def main():
         ]
 
         # ========================================================
-        # XUẤT FILE ERROR ANALYSIS
+        # XUẤT FILE ERROR ANALYSIS (ĐÃ SỬA LỖI KEYERROR)
         # ========================================================
         import csv
         
         error_file = os.path.join(training_args.output_dir, "error_analysis.csv")
-        original_tokens = test_dataset["words"] if "words" in test_dataset.column_names else test_dataset["tokens"]
+        
+        # 1. Gọi dữ liệu thô từ datasets["test"] thay vì test_dataset
+        raw_test = datasets["test"]
+        text_col = "words" if "words" in raw_test.column_names else "tokens"
+        
+        # 2. Khớp các batch dự đoán về đúng index của văn bản gốc
+        original_tokens = [raw_test[i][text_col] for i in test_dataset["overflow_to_sample_mapping"]]
 
         if trainer.is_world_process_zero():
             with open(error_file, "w", encoding="utf-8", newline="") as f:
@@ -676,7 +682,7 @@ def main():
                             
             logger.info(f"\n[+] ĐÃ XUẤT FILE PHÂN TÍCH LỖI TẠI: {error_file}\n")
         # ========================================================
-
+        
         trainer.log_metrics("test", metrics)
         trainer.save_metrics("test", metrics)
 
