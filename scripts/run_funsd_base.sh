@@ -32,8 +32,7 @@ do
     rm -rf "$OUT"
 
     # GỌI PYTHON TỪ CONDA ENV THAY VÌ PYTHON HỆ THỐNG
-    $PYTHON_CMD -m torch.distributed.launch \
-      --nproc_per_node=2 \
+    $PYTHON_CMD -m torch.distributed.launch --nproc_per_node=2 examples/run_funsd_cord.py
       --dataset_name funsd \
       --do_train \
       --do_eval \
