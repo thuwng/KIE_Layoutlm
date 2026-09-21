@@ -33,6 +33,7 @@ do
 
     # GỌI PYTHON TỪ CONDA ENV THAY VÌ PYTHON HỆ THỐNG
     $PYTHON_CMD examples/run_funsd_cord.py \
+      --nproc_per_node=2 \
       --dataset_name funsd \
       --do_train \
       --do_eval \
