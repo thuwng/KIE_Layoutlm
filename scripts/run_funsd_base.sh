@@ -52,7 +52,7 @@ do
       --per_device_train_batch_size 2 \
       --gradient_accumulation_steps 8 \
       --dataloader_num_workers 4 \
-      --report_to wandb \
+      --report_to none \
       --run_name "FUNSD-LR-Split-seed${SEED}" \
       --seed "$SEED" \
       --overwrite_output_dir \
