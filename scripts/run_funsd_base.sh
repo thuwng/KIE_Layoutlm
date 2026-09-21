@@ -43,6 +43,7 @@ do
       --segment_level_layout 1 \
       --visual_embed 1 \
       --input_size 224 \
+      --max_steps 1000 \
       --save_steps 1000 \
       --evaluation_strategy steps \
       --eval_steps 100 \
