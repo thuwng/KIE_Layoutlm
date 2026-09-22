@@ -25,7 +25,7 @@ rm -rf "$OUT"
   --model_name_or_path /kaggle/working/layoutlmv3-base-local \
   --output_dir "$OUT" \
   --input_size 224 \
-  --max_steps 200 \
+  --max_steps 1000 \
   --save_steps 1000 \
   --evaluation_strategy steps \
   --eval_steps 100 \
