@@ -1,7 +1,7 @@
 import torch
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Union
-
+import random
 from transformers import BatchEncoding, PreTrainedTokenizerBase
 from transformers.data.data_collator import (
     DataCollatorMixin,
@@ -30,6 +30,47 @@ class DataCollatorForKeyValueExtraction(DataCollatorMixin):
     label_pad_token_id: int = -100
     training: bool = True              # THÊM MỚI
 
+    def _generate_dynamic_segments(self, bboxes):
+        """ Sinh segment_ids và seg_bbox động theo khoảng cách tọa độ """
+        S = len(bboxes)
+        seg_ids = [-1] * S
+        seg_bboxes = []
+        
+        current_seg = 0
+        for i in range(S):
+            if bboxes[i] == [0, 0, 0, 0]: # Bỏ qua token đặc biệt/padding
+                continue
+            if i == 0 or bboxes[i-1] == [0, 0, 0, 0]:
+                seg_ids[i] = current_seg
+            else:
+                box_prev = bboxes[i-1]
+                box_curr = bboxes[i]
+                
+                # Tính độ chồng lấn trục Y và khoảng cách trục X
+                y_overlap = min(box_prev[3], box_curr[3]) - max(box_prev[1], box_curr[1])
+                x_dist = box_curr[0] - box_prev[2]
+                
+                # Heuristic: Cùng dòng ngang (chồng lấn Y > 0) và khoảng cách X không quá xa
+                if y_overlap > 0 and -20 <= x_dist < 60:
+                    seg_ids[i] = current_seg
+                else:
+                    current_seg += 1
+                    seg_ids[i] = current_seg
+                    
+        # Tính toán lại khung Bbox bao trọn cho từng Segment mới
+        for s in range(current_seg + 1):
+            s_boxes = [bboxes[i] for i in range(S) if seg_ids[i] == s]
+            if s_boxes:
+                min_x = min(b[0] for b in s_boxes)
+                min_y = min(b[1] for b in s_boxes)
+                max_x = max(b[2] for b in s_boxes)
+                max_y = max(b[3] for b in s_boxes)
+                seg_bboxes.append([min_x, min_y, max_x, max_y])
+            else:
+                seg_bboxes.append([0, 0, 0, 0])
+                
+        return seg_ids, seg_bboxes
+
     def __call__(self, features):
         for f in features:
             f.pop("overflow_to_sample_mapping", None)
@@ -37,9 +78,22 @@ class DataCollatorForKeyValueExtraction(DataCollatorMixin):
         label_name = "label" if "label" in features[0].keys() else "labels"
         labels = [feature.pop(label_name) for feature in features] if label_name in features[0].keys() else None
 
-        # Rút các trường Segment mới
+        # 2. THÊM LOGIC PHÁ BỎ SEGMENT Ở ĐÂY
+        if self.training and random.random() < 0.5:
+            for f in features:
+                if "bbox" in f:
+                    new_seg_ids, new_seg_bboxes = self._generate_dynamic_segments(f["bbox"])
+                    f["seg_id"] = new_seg_ids
+                    f["seg_bbox"] = new_seg_bboxes
+
+        # 3. SỬA ĐOẠN POP (LOẠI BỎ IS_FIRST HOÀN TOÀN)
         seg_id = [feature.pop("seg_id") for feature in features] if "seg_id" in features[0] else None
-        is_first = [feature.pop("is_first") for feature in features] if "is_first" in features[0] else None
+        
+        # Xóa vĩnh viễn is_first khỏi features để không gây lỗi
+        if "is_first" in features[0]:
+            for feature in features:
+                feature.pop("is_first", None)
+                
         seg_bbox = [feature.pop("seg_bbox") for feature in features] if "seg_bbox" in features[0] else None
 
         images = None

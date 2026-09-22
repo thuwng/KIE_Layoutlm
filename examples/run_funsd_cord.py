@@ -343,7 +343,6 @@ def main():
         bboxes = []
         images = []
         seg_ids = []
-        is_firsts = []
         seg_boxes_all = []
 
         for batch_index in range(len(tokenized_inputs["input_ids"])):
@@ -369,7 +368,6 @@ def main():
             label_ids = []
             bbox_inputs = []
             seg_id_inputs = []
-            is_first_inputs = []
 
             for word_idx in word_ids:
                 if word_idx is None:
@@ -377,22 +375,16 @@ def main():
                     bbox_inputs.append([0, 0, 0, 0])
                     if word_seg_id is not None:
                         seg_id_inputs.append(-1)
-                        is_first_inputs.append(0)
                 elif word_idx != previous_word_idx:
                     label_ids.append(label_to_id[label[word_idx]])
                     bbox_inputs.append(bbox[word_idx])
                     if word_seg_id is not None:
                         seg_id_inputs.append(word_seg_id[word_idx])
-                        if len(seg_id_inputs) == 1 or seg_id_inputs[-1] != seg_id_inputs[-2]:
-                            is_first_inputs.append(1)
-                        else:
-                            is_first_inputs.append(0)
                 else:
                     label_ids.append(label_to_id[label[word_idx]] if data_args.label_all_tokens else -100)
                     bbox_inputs.append(bbox[word_idx])
                     if word_seg_id is not None:
                         seg_id_inputs.append(word_seg_id[word_idx])
-                        is_first_inputs.append(0)
                 previous_word_idx = word_idx
 
             labels.append(label_ids)
@@ -404,7 +396,6 @@ def main():
                 
                 mapped_seg_ids = [remap[x] if x >= 0 else -1 for x in seg_id_inputs]
                 seg_ids.append(mapped_seg_ids)
-                is_firsts.append(is_first_inputs)
                 
                 seg_boxes = []
                 for s in uniq_segs:
@@ -415,7 +406,6 @@ def main():
                 seg_boxes_all.append(seg_boxes)
             else:
                 seg_ids.append([])
-                is_firsts.append([])
                 seg_boxes_all.append([])
 
             if data_args.visual_embed:
@@ -430,7 +420,6 @@ def main():
         
         if getattr(data_args, "use_segment_head", False):
             tokenized_inputs["seg_id"] = seg_ids
-            tokenized_inputs["is_first"] = is_firsts
             tokenized_inputs["seg_bbox"] = seg_boxes_all
 
         if data_args.visual_embed:

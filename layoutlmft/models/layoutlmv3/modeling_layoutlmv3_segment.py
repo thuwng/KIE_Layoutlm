@@ -90,11 +90,11 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
         # Cải tiến 2: Segment Context Encoder
         self.segment_encoder = MultimodalSegmentEncoderLayer(config.hidden_size)
         
-        # Cải tiến 3: BIO-aware Gating
-        self.bio_embed = nn.Embedding(2, config.hidden_size)
-        self.gate_linear = nn.Linear(config.hidden_size * 2, config.hidden_size)
-        torch.nn.init.constant_(self.gate_linear.bias, 3.0)
-
+        # Cải tiến 3 (MỚI): Zero-initialized Residual Projection
+        self.segment_proj = nn.Linear(config.hidden_size, config.hidden_size)
+        # Khởi tạo trọng số bằng 0 để lúc mới train, model tương đương với LayoutLMv3 gốc
+        nn.init.zeros_(self.segment_proj.weight)
+        nn.init.zeros_(self.segment_proj.bias)
         self.init_weights()
 
     def _pool_text(self, h, seg_id, max_seg):
@@ -175,16 +175,10 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
             broadcast_ctx = seg_ctx.gather(1, idx.unsqueeze(-1).expand(-1, -1, text_hidden.size(-1)))
             broadcast_ctx = broadcast_ctx * valid.unsqueeze(-1).to(text_hidden.dtype)
             
-            # Cải tiến 3: BIO-Aware Gating Fusion
-            if is_first is not None:
-                bio_bias = self.bio_embed(is_first)
-                broadcast_ctx = broadcast_ctx + bio_bias
-            
-            gate_input = torch.cat([text_hidden, broadcast_ctx], dim=-1)
-            gate = torch.sigmoid(self.gate_linear(gate_input))
-            
-            # Fuse mềm mại, giữ lại đặc trưng từ vựng
-            text_hidden = gate * text_hidden + (1 - gate) * broadcast_ctx
+            # Cải tiến 3 (MỚI): Residual Connection
+            # Chiếu đặc trưng segment và cộng dồn trực tiếp vào token
+            segment_context = self.segment_proj(broadcast_ctx)
+            text_hidden = text_hidden + segment_context
             
         if images is not None and sequence_output.shape[1] > text_len:
             pooled_sequence = torch.cat([text_hidden, sequence_output[:, text_len:]], dim=1)
