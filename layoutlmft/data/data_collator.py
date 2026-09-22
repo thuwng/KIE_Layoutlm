@@ -127,8 +127,7 @@ class DataCollatorForKeyValueExtraction(DataCollatorMixin):
             batch["bbox"] = [bbox + [[0, 0, 0, 0]] * (sequence_length - len(bbox)) for bbox in batch["bbox"]]
         if seg_id is not None:
             batch["seg_id"] = [s + [-1] * (sequence_length - len(s)) for s in seg_id]
-            batch["is_first"] = [f + [0] * (sequence_length - len(f)) for f in is_first]
-
+            # ĐÃ XÓA PAD is_first VÌ P1 KHÔNG CÒN DÙNG TỚI NỮA
         batch = {k: torch.tensor(v, dtype=torch.int64) if isinstance(v[0], list) else v for k, v in batch.items()}
 
         # Padding thủ công cho Segment Bbox (2D padding)
